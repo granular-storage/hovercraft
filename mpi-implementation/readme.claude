@@ -1,0 +1,207 @@
+How to run on Meluxina
+Take one node
+srun --partition=gpu --account=p200633 --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus-per-task=0 --cpus-per-task=64 --mem=32GB --time=03:25:00 --qos=default --pty /bin/bash -l
+
+ml env/release/2024.1
+ml OpenMPI/5.0.3-GCC-13.3.0
+
+COMPILE
+
+make clean && make
+
+mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1000000
+
+ONCE compiled, run with multiple nodes
+
+sbatch run_multi_node.sh
+
+# HoverCraft++ Consensus Protocol Implementation
+
+This is a C++ implementation of the HoverCraft++ consensus protocol based on the TLA+ specification. It demonstrates the protocol's key components and message flow in a perfect network environment (no failures or message loss).
+
+## Components
+
+1. **Switch (Rank 0)**: Receives client requests and replicates payloads to all servers
+2. **Leader (Rank 1)**: Orders requests and sends metadata to NetAgg
+3. **Follower1 (Rank 2)**: Receives payloads and metadata, maintains replicated log
+4. **Follower2 (Rank 3)**: Same as Follower1
+5. **NetAgg (Rank 4)**: Aggregates acknowledgments and sends commit messages
+6. **Client (Rank 5)**: Sends requests and measures end-to-end latency
+
+Key Components:
+
+common.hpp: Defines all message types, structures, and common utilities
+switch.cpp: Implements the Switch that receives client requests and replicates payloads
+leader.cpp: Implements the Leader that orders requests and coordinates with NetAgg
+netagg.cpp: Implements the NetAgg that aggregates follower acknowledgments
+follower.cpp: Implements Followers that maintain replicated logs
+client.cpp: Implements a Client that sends requests and measures latency
+main.cpp: Main driver that launches all components based on MPI rank
+Makefile: Build configuration
+README.md: Documentation
+
+
+## Protocol Flow
+
+1. Client sends request to Switch with designated responder
+2. Switch replicates payload to Leader and all Followers
+3. Leader orders the request and sends metadata to NetAgg
+4. NetAgg forwards metadata to Followers
+5. Followers acknowledge to NetAgg
+6. NetAgg sends AggCommit to all servers when majority achieved
+7. Designated server responds to Client
+
+## Building
+
+```bash
+make
+```
+
+## Running
+
+Default run with 100 requests:
+```bash
+make run
+```
+
+Run with custom number of requests:
+```bash
+make run-custom REQUESTS=1000
+```
+
+Or directly:
+```bash
+mpirun -np 6 ./hovercraft_demo [num_requests]
+```
+
+## Output
+
+The program outputs:
+- Debug logs from each component showing message flow
+- Latency statistics including average, min, max, and percentiles
+
+## Key Features Demonstrated
+
+- **Decoupled Payload Replication**: Switch handles payload distribution separately from ordering
+- **Network Aggregation**: NetAgg reduces leader's coordination overhead
+- **Load Balancing**: Client can designate any server to respond
+- **Perfect Prototype**: Assumes no failures for measuring baseline performance
+
+## Implementation Notes
+
+- Uses MPI for inter-process communication
+- Simple serialization format (pipe-delimited strings)
+- Fixed component assignment (no leader election)
+- Synchronous message handling with polling
+- Measures end-to-end latency from client perspective
+
+## Limitations
+
+This is a simplified prototype that:
+- Assumes perfect network (no message loss)
+- Does not implement leader election
+- Does not handle server crashes
+- Uses basic serialization (production would use protobuf/similar)
+- Does not implement point-to-point recovery for failed followers
+
+HowTo run on Meluxina
+
+rsync --rsh='ssh -p 8822 -i ~/.ssh/id_ed25519_mlux' -avzu ~/Documents/granular-storage/hovercraft-simulator/claude/ u100122@login.lxp.lu:/home/users/u100122/hovercraft/claude/
+
+ml env/release/2024.1
+ml OpenMPI/5.0.3-GCC-13.3.0
+[u100122@mel2044 ~]$ make clean
+make: *** No rule to make target 'clean'.  Stop.
+[u100122@mel2044 ~]$ cd hovercraft/claude/
+[u100122@mel2044 claude]$ make clean
+rm -f hovercraft_demo switch leader follower netagg client *.o
+[u100122@mel2044 claude]$ make
+mpic++ -std=c++17 -O2 -Wall -Wextra -o hovercraft_demo main.cpp
+In file included from main.cpp:3:
+common.hpp: In function ‘void log_debug(const std::string&, const std::string&)’:
+common.hpp:114:42: warning: unused parameter ‘component’ [-Wunused-parameter]
+  114 | inline void log_debug(const std::string& component, const std::string& message) {
+      |                       ~~~~~~~~~~~~~~~~~~~^~~~~~~~~
+common.hpp:114:72: warning: unused parameter ‘message’ [-Wunused-parameter]
+  114 | inline void log_debug(const std::string& component, const std::string& message) {
+      |                                                     ~~~~~~~~~~~~~~~~~~~^~~~~~~
+[u100122@mel2044 claude]$ mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1
+[CLIENT] Received response for value 1 from server 3 (expected 3), result=SUCCESS, latency: 0.272000 ms
+
+=== Latency Statistics (ms) ===
+Requests processed: 1
+Average: 0.272
+Min:     0.272
+Max:     0.272
+P50 (Median): 0.272
+P90:     0.272
+P99:     0.272
+==============================
+
+Client completed. Exiting...
+
+
+I_MPI_FABRICS=shm mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 200000
+
+with MPICH
+
+ 1002  ml env/release/2024.1
+ 1003  ml MPICH/4.2.2-GCC-13.3.0
+ 1004  make clean
+ 1005  make
+ 1006  MPIR_CVAR_CH4_NETMOD=shm mpirun -np 6 --bind-to core ./hovercraft_demo 3000000
+ 
+ --- Statistics for interval ending at 2990000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.320
+P50 (Median): 0.030
+P90:     0.031
+P99:     0.038
+==============================
+
+
+--- Statistics for interval ending at 2995000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.242
+P50 (Median): 0.030
+P90:     0.034
+P99:     0.038
+==============================
+
+
+--- Statistics for interval ending at 3000000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.230
+P50 (Median): 0.030
+P90:     0.033
+P99:     0.038
+==============================
+
+
+=== Latency Statistics (ms) ===
+No responses received.
+==============================
+
+
+==============================
+Client total runtime: 19.521 seconds.
+==============================
+
+Client completed. Sending shutdown signal...
+
+
+srun --partition=gpu --account=p200633 --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus-per-task=0 --cpus-per-task=64 --mem=32GB --time=03:25:00 --qos=default --pty /bin/bash -l
+
+ 

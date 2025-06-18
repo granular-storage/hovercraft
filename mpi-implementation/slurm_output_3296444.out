@@ -1,0 +1,82 @@
+Sourcing /etc/profile to set up environment...
+Environment sourced.
+
+Loading environment modules...
+Modules loaded.
+
+Slurm Job ID: 3296444
+Running on nodes: 
+mel2101
+mel2103
+mel2121
+mel2122
+mel2123
+mel2124
+--------------------------
+
+Launching HoverCraft++ with 1,000,000 requests...
+
+--- Statistics for interval ending at 100000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.768
+Min:     0.356
+Max:     51.175
+P50 (Median): 5.785
+P90:     5.922
+P99:     6.169
+==============================
+
+
+--- Statistics for interval ending at 200000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.605
+Min:     0.369
+Max:     7.128
+P50 (Median): 5.816
+P90:     5.937
+P99:     6.164
+==============================
+
+
+--- Statistics for interval ending at 300000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.600
+Min:     0.396
+Max:     7.127
+P50 (Median): 5.814
+P90:     5.939
+P99:     6.156
+==============================
+
+
+--- Statistics for interval ending at 400000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.614
+Min:     0.357
+Max:     7.136
+P50 (Median): 5.832
+P90:     5.951
+P99:     6.175
+==============================
+
+
+--- Statistics for interval ending at 500000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.773
+Min:     0.383
+Max:     53.330
+P50 (Median): 5.833
+P90:     5.962
+P99:     7.735
+==============================
+
