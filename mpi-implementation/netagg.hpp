@@ -42,10 +42,13 @@ private:
     // --- BATCHING TIMER ---
     std::chrono::high_resolution_clock::time_point aggCommitBatchTimer;
 
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
     void handleAppendEntriesFromLeader(MPI_Status& status);
     void forwardToFollowers(const AppendEntriesNetAggMsg& leaderMsg, const std::vector<RequestID>& batch_rids);
     void handleAppendEntriesResponse(MPI_Status& status);
-    void sendBatchedAggCommits();
+    bool sendBatchedAggCommits();
     void checkCompletedSends();
 
 public:

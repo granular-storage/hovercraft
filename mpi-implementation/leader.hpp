@@ -35,11 +35,14 @@ private:
     };
     std::list<OutstandingSend> outstandingSends;
 
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
     void handleSwitchReplicate(MPI_Status& status);
-    void processUnorderedRequests();
-    void sendToNetAgg();
+    bool processUnorderedRequests();
+    bool sendToNetAgg();
     void handleAggCommit(MPI_Status& status);
-    void sendBatchedClientResponses();
+    bool sendBatchedClientResponses();
     void checkCompletedSends();
 
 public:

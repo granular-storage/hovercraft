@@ -17,11 +17,27 @@
 bool shutdown_flag = false;
 
 int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+    // MPI_Init(&argc, &argv);
+    
+    // int rank, size;
+    // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    // MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int provided_thread_level;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_level);
     
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Check if the MPI library provides the required level of thread support
+    if (provided_thread_level < MPI_THREAD_MULTIPLE) {
+        if (rank == 0) {
+            fprintf(stderr, "ERROR: Your MPI implementation does not support MPI_THREAD_MULTIPLE.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
     
     if (size != 6) {
         if (rank == 0) {
@@ -67,10 +83,7 @@ int main(int argc, char** argv) {
                 numRequests = std::atoi(argv[1]);
             }
             
-            // Give other components time to initialize
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            // Use MPI_Barrier for robust startup synchronization
-            // MPI_Barrier(MPI_COMM_WORLD); //todo should use this not sleep
 
             auto start_time = std::chrono::high_resolution_clock::now();
             

@@ -1,7 +1,7 @@
 # Makefile for HoverCraft++ prototype
 
 CXX = mpic++
-CXXFLAGS = -std=c++17 -O2 -Wall -Wextra
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pthread
 TARGET = hovercraft_demo
 
 # Component source files (separate compilation)

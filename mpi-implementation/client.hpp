@@ -6,7 +6,9 @@
 #include <thread>
 #include <algorithm>
 #include <iomanip>
-#include <list> // For managing outstanding sends
+#include <list>    // For managing outstanding sends
+#include <atomic>  // For thread-safe flag
+#include <mutex>   // For protecting shared data
 
 class Client {
 private:
@@ -20,9 +22,20 @@ private:
         int respondTo;
         std::chrono::high_resolution_clock::time_point startTime;
     };
+
+    // --- Threading Members ---
+    // A recursive mutex allows a thread to re-lock a mutex it already holds.
+    // This is needed because handleResponse() (which holds the lock) calls
+    // printStatistics() (which also needs the lock).
+    std::recursive_mutex dataMutex;
     std::map<int, RequestTracker> pendingRequests;
     std::vector<double> latencies;
     long long processedRequestCount;
+    std::thread receiverThread;
+    std::atomic<bool> stopReceiverFlag;
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
 
     // Structure for non-blocking sends
     struct OutstandingSend {
@@ -34,7 +47,10 @@ private:
     void sendRequest(int value);
     void handleResponse(MPI_Status& status);
     void printStatistics();
-    void checkCompletedSends(); // New function
+    void checkCompletedSends();
+
+    // The function for the receiver thread
+    void receiverLoop();
 
 public:
     Client();

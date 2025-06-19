@@ -1,8 +1,10 @@
+// === FILE: leader.cpp ===
 #include "leader.hpp"
 #include <vector>
+#include <chrono>
 
 Leader::Leader() : rank(LEADER_RANK), currentTerm(1), logStartIndex_0based(0), commitIndex(-1), lastSentLogIndexToNetAgg(-1),
-                   clientResponseBatchTimer() {
+                   clientResponseBatchTimer(), noProgressCounter(0) {
     nextIndex[FOLLOWER1_RANK] = 1;
     nextIndex[FOLLOWER2_RANK] = 1;
     matchIndex[FOLLOWER1_RANK] = -1;
@@ -10,7 +12,6 @@ Leader::Leader() : rank(LEADER_RANK), currentTerm(1), logStartIndex_0based(0), c
 }
 
 Leader::~Leader() {
-    // Clean up any remaining allocated buffers for sends that might not have completed.
     for (auto& send : outstandingSends) {
         delete[] send.buffer;
     }
@@ -19,30 +20,115 @@ Leader::~Leader() {
 void Leader::run(bool& shutdown_flag) {
     log_debug("LEADER", "Started with rank " + std::to_string(rank) +
               ", term " + std::to_string(currentTerm));
+    
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;
+    
+    // *** ENHANCED LEADER FLOW CONTROL ***
+    const int AGGRESSIVE_CLEANUP_THRESHOLD = 50;
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int cleanupCounter = 0;
 
     while (!shutdown_flag) {
+        // *** MORE AGGRESSIVE SEND COMPLETION CHECKING FOR LATENCY ***
+        checkCompletedSends();
+
         MPI_Status status;
         int flag = 0;
+        bool progress_made = false;
 
-        MPI_Iprobe(SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &flag, &status);
-        if (flag) {
-            handleSwitchReplicate(status);
+        // *** IMPROVED BACKPRESSURE MANAGEMENT ***
+        bool canAcceptFromSwitch = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.8));  // More conservative
+        bool canSendToNetAgg = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.9));       // Increased from default - more parallel
+        
+        if (canAcceptFromSwitch) {
+            MPI_Iprobe(SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &flag, &status);
+            if (flag) {
+                handleSwitchReplicate(status);
+                progress_made = true;
+                checkCompletedSends();  // Immediate cleanup after receiving
+            }
         }
 
+        // Always probe for commits from NetAgg, as they help clear the pipeline
         MPI_Iprobe(NETAGG_RANK, AGG_COMMIT, MPI_COMM_WORLD, &flag, &status);
         if (flag) {
             handleAggCommit(status);
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after commit
         }
 
-        processUnorderedRequests();
-        sendToNetAgg();
-        sendBatchedClientResponses();
+        if (processUnorderedRequests()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after processing
+        }
+        if (sendToNetAgg()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after sending
+        }
+        if (sendBatchedClientResponses()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after responses
+        }
         
-        checkCompletedSends();
+        // *** ADDITIONAL CLEANUP CYCLES ***
+        cleanupCounter++;
+        if (cleanupCounter % 100 == 0) {
+            checkCompletedSends();
+        }
+        
+        if (outstandingSends.size() > AGGRESSIVE_CLEANUP_THRESHOLD) {
+            checkCompletedSends();
+        }
+        
+        if (progress_made) {
+            noProgressCounter = 0;
+        } else {
+            noProgressCounter++;
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                // *** ENHANCED STALL LOGGING ***
+                std::cout << "[LEADER_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                         << ", Unordered: " << unorderedRequests.size() 
+                         << ", Client responses: " << clientResponseBuffer.size()
+                         << ", Can accept: " << (canAcceptFromSwitch ? "YES" : "NO") << std::endl;
+            }
+        }
+        
+        // *** PERIODIC HEALTH REPORTING ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
+        if (timeSinceStats.count() >= 30) {
+            std::cout << "[LEADER_STATUS] Log size: " << log.size() 
+                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                     << ", Unordered: " << unorderedRequests.size()
+                     << ", Commit index: " << commitIndex 
+                     << ", Progress checks: " << noProgressCounter << std::endl;
+            lastStatsTime = currentTime;
+        }
+        
+        // *** EMERGENCY CLEANUP FOR REQUEST BUFFER OVERFLOW ***
+        if (requestBuffer.size() > 500) {  // Emergency threshold
+            std::cout << "[LEADER_WARNING] Request buffer overflow: " << requestBuffer.size() 
+                     << ", forcing cleanup and processing" << std::endl;
+            
+            // Force multiple cleanup cycles
+            for (int i = 0; i < 5; i++) {
+                checkCompletedSends();
+            }
+            
+            // Force process some unordered requests even if it might create more sends
+            if (unorderedRequests.size() > 100) {
+                processUnorderedRequests();  // Force processing
+            }
+        }
     }
 }
 
-void Leader::sendToNetAgg() {
+bool Leader::sendToNetAgg() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
+    }
+
     int nextLogIndexToSend_0based = lastSentLogIndexToNetAgg + 1;
     int lastLogIndex_0based = logStartIndex_0based + log.size() - 1;
 
@@ -53,17 +139,17 @@ void Leader::sendToNetAgg() {
             int deque_idx = current_absolute_idx - logStartIndex_0based;
             const LogEntry& entry = log[deque_idx];
             batch_ids.push_back({entry.value, entry.term});
+            // std::cout << "[LEADER] SEND_TO_NETAGG value=" << entry.value << std::endl;
         }
 
-        if (batch_ids.empty()) return;
+        if (batch_ids.empty()) return false;
 
         AppendEntriesNetAggMsg msg;
         msg.term = currentTerm;
-        msg.prevLogIndex = nextLogIndexToSend_0based; // This is 0-based for log, but protocol expects 1-based for index > 0
+        msg.prevLogIndex = nextLogIndexToSend_0based; 
         msg.prevLogTerm = 0;
         if (msg.prevLogIndex > 0) {
             int prev_deque_idx = (msg.prevLogIndex - 1) - logStartIndex_0based;
-            // This should always be a valid index on the leader
             if (prev_deque_idx >= 0 && prev_deque_idx < static_cast<int>(log.size())) {
                 msg.prevLogTerm = log[prev_deque_idx].term;
             }
@@ -93,33 +179,40 @@ void Leader::sendToNetAgg() {
         outstandingSends.push_back({mpi_req, send_buffer});
 
         lastSentLogIndexToNetAgg += batch_ids.size();
+        return true;
     }
+    return false;
 }
 
-void Leader::sendBatchedClientResponses() {
-    // 1. If the buffer is empty, there's nothing to do.
-    if (clientResponseBuffer.empty()) {
-        return;
+bool Leader::sendBatchedClientResponses() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
     }
 
-    // 2. If the timer is not set, start it for this new batch.
+    if (clientResponseBuffer.empty()) {
+        return false;
+    }
+
+    // *** ENHANCED BATCHING LOGIC FOR ULTRA-LOW LATENCY ***
     if (clientResponseBatchTimer == std::chrono::high_resolution_clock::time_point{}) {
         clientResponseBatchTimer = std::chrono::high_resolution_clock::now();
     }
 
-    // 3. Decide whether to send the batch now.
     auto now = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - clientResponseBatchTimer);
 
-    // BATCH_TIMEOUT_MS is defined in follower.cpp
     bool batchIsFull = clientResponseBuffer.size() >= BATCH_SIZE;
     bool timeoutReached = elapsed.count() >= BATCH_TIMEOUT_MS;
 
-    if (!batchIsFull && !timeoutReached) {
-        return; // Wait for more items or timeout.
+    // *** ULTRA-AGGRESSIVE RESPONSE SENDING FOR LATENCY ***
+    bool forceImmediate = clientResponseBuffer.size() >= 5;   // Reduced from 10
+    bool ultraFast = clientResponseBuffer.size() >= 1 && elapsed.count() >= 1;  // 1ms timeout for any response
+    bool shortTimeout = clientResponseBuffer.size() > 2 && elapsed.count() >= (BATCH_TIMEOUT_MS / 3);  // Even shorter
+
+    if (!batchIsFull && !timeoutReached && !forceImmediate && !shortTimeout && !ultraFast) {
+        return false;
     }
 
-    // 4. Time to send.
     size_t count_to_send = clientResponseBuffer.size();
 
     std::string response_str = "SUCCESS";
@@ -138,9 +231,17 @@ void Leader::sendBatchedClientResponses() {
 
     outstandingSends.push_back({mpi_req, send_buffer});
 
-    // 5. Clean up and reset for the next batch.
+    // *** ENHANCED LOGGING FOR RESPONSE SENDING (REDUCED FOR LATENCY) ***
+    if (count_to_send > 3 || forceImmediate || ultraFast) {  // Only log for larger batches
+        std::cout << "[LEADER_RESPONSE_SEND] Sent " << count_to_send 
+                 << " responses" << (forceImmediate ? " (FORCED)" : "") 
+                 << (shortTimeout ? " (SHORT_TIMEOUT)" : "")
+                 << (ultraFast ? " (ULTRA_FAST)" : "") << std::endl;
+    }
+
     clientResponseBuffer.erase(clientResponseBuffer.begin(), clientResponseBuffer.begin() + count_to_send);
     clientResponseBatchTimer = std::chrono::high_resolution_clock::time_point{};
+    return true;
 }
 
 void Leader::checkCompletedSends() {
@@ -179,13 +280,19 @@ void Leader::handleSwitchReplicate(MPI_Status& status) {
     std::string payload = parts[2];
     int clientRank = std::stoi(parts[3]);
 
+    // std::cout << "[LEADER] RECV_REPL value=" << rid.value << std::endl;
+
     if (requestBuffer.find(rid) == requestBuffer.end()) {
         requestBuffer[rid] = LogEntry(rid.term, rid.value, payload, clientRank);
         unorderedRequests.insert(rid);
     }
 }
 
-void Leader::processUnorderedRequests() {
+bool Leader::processUnorderedRequests() {
+    if (unorderedRequests.empty()) {
+        return false;
+    }
+    
     auto it = unorderedRequests.begin();
     while (it != unorderedRequests.end()) {
         const RequestID& rid_from_switch = *it;
@@ -194,7 +301,6 @@ void Leader::processUnorderedRequests() {
             LogEntry entry_data = buffer_it->second;
             entry_data.term = currentTerm;
 
-            // Append to log and manage fixed size
             log.push_back(entry_data);
             if (log.size() > LOG_MAX_SIZE) {
                 log.pop_front();
@@ -207,6 +313,7 @@ void Leader::processUnorderedRequests() {
             it = unorderedRequests.erase(it);
         }
     }
+    return true;
 }
 
 void Leader::handleAggCommit(MPI_Status& status) {
@@ -241,7 +348,6 @@ void Leader::handleAggCommit(MPI_Status& status) {
         commitIndex = std::min(maxCommitIndexInBatch_0based, last_log_idx_0based);
 
         for (int i = old_commit_idx + 1; i <= commitIndex; ++i) {
-            // Check if this committed entry is still in our log window
             if (i >= logStartIndex_0based) {
                 int deque_idx = i - logStartIndex_0based;
                 if (log[deque_idx].clientRank == rank) {

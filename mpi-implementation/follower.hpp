@@ -33,11 +33,14 @@ private:
     // --- FIX: Members for periodic cleanup ---
     long long append_count; // Counter to trigger periodic cleanup
 
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
     void handleSwitchReplicate(MPI_Status& status);
     void handleAppendEntries(MPI_Status& status);
     void sendAppendEntriesResponse(bool success, int matchIdx_1based);
     void handleAggCommit(MPI_Status& status);
-    void sendBatchedClientResponses();
+    bool sendBatchedClientResponses();
     void checkCompletedSends();
     void pruneRequestBuffer(); // New cleanup function
 

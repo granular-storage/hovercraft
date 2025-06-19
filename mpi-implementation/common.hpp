@@ -11,6 +11,7 @@
 #include <sstream> // For string splitting helper
 #include <cstring>
 #include <deque> // For fixed-size log
+#include <cstdint> // For uint64_t
 
 // MPI Tags for different message types
 enum MessageType {
@@ -34,13 +35,13 @@ enum ComponentID {
     CLIENT_RANK = 5
 };
 
-const int BATCH_SIZE = 10; // Max number of entries in a message batch
-const int LOG_MAX_SIZE = 5000; // Max number of entries to keep in server logs
-const int BATCH_TIMEOUT_MS = 1000; // Batching timeout in milliseconds
+const int BATCH_SIZE = 1; // Max number of entries in a message batch
+const int LOG_MAX_SIZE = 1000; // Max number of entries to keep in server logs
+const int BATCH_TIMEOUT_MS = 5; // Reduced from 25ms - much more aggressive for low latency
 
-const int STATS_INTERVAL = 100000;
+const int STATS_INTERVAL = 1000;
 
-const int MAX_OUTSTANDING_SENDS = 5000; // Limit outstanding MPI sends
+const int MAX_OUTSTANDING_SENDS = 100; // Limit outstanding MPI sends
 
 // Request identifier
 struct RequestID {
@@ -125,7 +126,13 @@ struct AggCommitMsg {
 
 // Utility functions
 inline void log_debug(const std::string& component, const std::string& message) {
-//    std::cout << "[" << component << "] " << message << std::endl;
+    //std::cout << "[" << component << "] " << message << std::endl;
+}
+
+// New function for progress logging
+inline void log_progress_stalled(const std::string& component, uint64_t checks) {
+    std::cout << "[" << component << "_STALLED] No progress after "
+              << checks << " checks." << std::endl;
 }
 
 // Helper to split string by delimiter

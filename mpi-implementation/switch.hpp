@@ -21,8 +21,11 @@ private:
     };
     std::list<OutstandingSend> outstandingSends;
 
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
     void handleClientRequest(MPI_Status& status);
-    void replicateBufferedRequests();
+    bool replicateBufferedRequests(); // Changed to bool
     // No change to sendReplicateMessage signature
     void sendReplicateMessage(int dest, const RequestID& rid, const LogEntry& entry);
     
