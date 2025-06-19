@@ -9,7 +9,7 @@
 #SBATCH --mem=16GB
 #SBATCH --ntasks=6
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:01:00
+#SBATCH --time=00:02:00
 #SBATCH --output=slurm_output_%j.out
 #SBATCH --error=slurm_output_%j.err
 #SBATCH --qos=default
@@ -44,9 +44,9 @@ echo ""
 # We also remove '--map-by core --bind-to core' because with only one task per node,
 # MPI's default process placement is usually optimal. The process has the entire
 # node's CPUs at its disposal.
-echo "Launching HoverCraft++ with 1,000,000 requests..."
+echo "Launching HoverCraft++ with 10,000,000 requests..."
 
-mpirun -np $SLURM_NTASKS ./hovercraft_demo 1000000
+mpirun -np $SLURM_NTASKS ./hovercraft_demo 10000000
 
 #use with 1 node 6 tasks per node
 #mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1000000
