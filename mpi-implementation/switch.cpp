@@ -71,10 +71,10 @@ void Switch::run(bool& shutdown_flag) {
             noProgressCounter++;
             if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
                 // *** ENHANCED STALL LOGGING ***
-                std::cout << "[SWITCH_STALLED] No progress after " << noProgressCounter 
-                         << " checks. Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
-                         << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
-                         << ", Can accept: " << (canAcceptRequests ? "YES" : "NO") << std::endl;
+                // std::cout << "[SWITCH_STALLED] No progress after " << noProgressCounter 
+                //          << " checks. Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
+                //          << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                //          << ", Can accept: " << (canAcceptRequests ? "YES" : "NO") << std::endl;
             }
         }
         
@@ -82,17 +82,17 @@ void Switch::run(bool& shutdown_flag) {
         auto currentTime = std::chrono::high_resolution_clock::now();
         auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
         if (timeSinceStats.count() >= 30) {  // Every 30 seconds
-            std::cout << "[SWITCH_STATUS] Processed: " << replicatedCount 
-                     << ", Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
-                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
-                     << ", Progress checks: " << noProgressCounter << std::endl;
+            // std::cout << "[SWITCH_STATUS] Processed: " << replicatedCount 
+            //          << ", Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
+            //          << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+            //          << ", Progress checks: " << noProgressCounter << std::endl;
             lastStatsTime = currentTime;
         }
         
         // *** EMERGENCY BUFFER OVERFLOW PROTECTION ***
         if (switchBuffer.size() >= MAX_BUFFER_SIZE * 0.9) {  // 90% full
-            std::cout << "[SWITCH_WARNING] Buffer near capacity: " << switchBuffer.size() 
-                     << "/" << MAX_BUFFER_SIZE << ", forcing aggressive cleanup" << std::endl;
+            // std::cout << "[SWITCH_WARNING] Buffer near capacity: " << switchBuffer.size() 
+            //          << "/" << MAX_BUFFER_SIZE << ", forcing aggressive cleanup" << std::endl;
             
             // Force multiple cleanup cycles
             for (int i = 0; i < 5; i++) {
@@ -101,14 +101,14 @@ void Switch::run(bool& shutdown_flag) {
             
             // If still problematic, drop oldest requests (emergency measure)
             if (switchBuffer.size() >= MAX_BUFFER_SIZE) {
-                std::cout << "[SWITCH_EMERGENCY] Dropping oldest buffered requests to prevent deadlock" << std::endl;
+                // std::cout << "[SWITCH_EMERGENCY] Dropping oldest buffered requests to prevent deadlock" << std::endl;
                 auto it = switchBuffer.begin();
                 int dropped = 0;
                 while (it != switchBuffer.end() && dropped < 50) {
                     it = switchBuffer.erase(it);
                     dropped++;
                 }
-                std::cout << "[SWITCH_EMERGENCY] Dropped " << dropped << " requests" << std::endl;
+                // std::cout << "[SWITCH_EMERGENCY] Dropped " << dropped << " requests" << std::endl;
             }
         }
     }
@@ -136,13 +136,15 @@ void Switch::handleClientRequest(MPI_Status& status) {
     request_msg.respondTo = std::stoi(parts[1]);
     request_msg.payload = parts[2];
 
-    // std::cout << "[SWITCH] RECV_REQ value=" << request_msg.value << std::endl;
-    
-    RequestID rid{request_msg.value, currentTerm};
-    LogEntry entry(currentTerm, request_msg.value, request_msg.payload, request_msg.respondTo);
+    RequestID rid{request_msg.value, currentTerm, status.MPI_SOURCE};
+    // Store both the actual client rank and which server should respond
+    LogEntry entry(currentTerm, request_msg.value, request_msg.payload, status.MPI_SOURCE, request_msg.respondTo);
     
     if (switchBuffer.find(rid) == switchBuffer.end()) {
         switchBuffer[rid] = entry;
+    } else {
+        // std::cout << "[SWITCH] Duplicate request " << request_msg.value 
+        //           << " from client " << status.MPI_SOURCE << " - IGNORED" << std::endl;
     }
 }
 
@@ -150,7 +152,8 @@ void Switch::sendReplicateMessage(int dest, const RequestID& rid, const LogEntry
     std::string msg_str = std::to_string(rid.value) + "|" + 
                          std::to_string(rid.term) + "|" + 
                          entry.payload + "|" + 
-                         std::to_string(entry.clientRank);
+                         std::to_string(entry.clientRank) + "|" +
+                         std::to_string(entry.respondTo);
 
     int msg_len = msg_str.length() + 1;
     char* send_buffer = new char[msg_len];
@@ -187,8 +190,8 @@ void Switch::checkCompletedSends() {
     
     // *** ENHANCED MONITORING FOR SEND COMPLETION ***
     if (initialCount > 50 && completedCount > 0) {  // Only log when there's significant activity
-        std::cout << "[SWITCH_SENDS] Completed " << completedCount << "/" << initialCount 
-                 << " sends, remaining: " << outstandingSends.size() << std::endl;
+        // std::cout << "[SWITCH_SENDS] Completed " << completedCount << "/" << initialCount 
+        //          << " sends, remaining: " << outstandingSends.size() << std::endl;
     }
     
     // *** WARNING FOR STUCK SENDS ***
@@ -196,9 +199,9 @@ void Switch::checkCompletedSends() {
     if (completedCount == 0 && initialCount > 75) {
         consecutiveNoCompletion++;
         if (consecutiveNoCompletion % 1000 == 0) {  // Every 1000 calls with no completion
-            std::cout << "[SWITCH_SEND_WARNING] " << consecutiveNoCompletion 
-                     << " consecutive cleanup cycles with no completions, outstanding: " 
-                     << outstandingSends.size() << std::endl;
+            // std::cout << "[SWITCH_SEND_WARNING] " << consecutiveNoCompletion 
+            //          << " consecutive cleanup cycles with no completions, outstanding: " 
+            //          << outstandingSends.size() << std::endl;
         }
     } else {
         consecutiveNoCompletion = 0;
@@ -217,9 +220,9 @@ bool Switch::replicateBufferedRequests() {
         // *** CHECK SEND QUEUE CAPACITY BEFORE EACH REQUEST ***
         // Each request generates 3 sends, so check if we have space for 3
         if (outstandingSends.size() > (MAX_OUTSTANDING_SENDS - 3)) {
-            std::cout << "[SWITCH_BACKPRESSURE] Send queue near capacity: " 
-                     << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS 
-                     << ", pausing replication" << std::endl;
+            // std::cout << "[SWITCH_BACKPRESSURE] Send queue near capacity: " 
+            //          << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS 
+            //          << ", pausing replication" << std::endl;
             return made_progress;
         }
 
@@ -269,8 +272,8 @@ bool Switch::replicateBufferedRequests() {
                     }
                 }
                 if (totalPruned > 0) {
-                    std::cout << "[SWITCH_PRUNED] Cleaned " << totalPruned 
-                             << " old sent records, threshold=" << prune_threshold << std::endl;
+                    // std::cout << "[SWITCH_PRUNED] Cleaned " << totalPruned 
+                    //          << " old sent records, threshold=" << prune_threshold << std::endl;
                 }
             }
         }

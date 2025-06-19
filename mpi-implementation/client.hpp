@@ -53,7 +53,7 @@ private:
     void receiverLoop();
 
 public:
-    Client();
+    Client(int clientRank);
     ~Client(); // Destructor
     void run(int numRequests);
 };

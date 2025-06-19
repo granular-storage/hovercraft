@@ -76,90 +76,53 @@ void NetAgg::run(bool& shutdown_flag) {
             noProgressCounter++;
             if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
                 // *** ENHANCED STALL LOGGING ***
-                std::cout << "[NETAGG_STALLED] No progress after " << noProgressCounter 
-                         << " checks. Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
-                         << ", Pending entries: " << pendingEntriesMap.size()
-                         << ", Commit buffer: " << aggCommitBuffer.size()
-                         << ", Can accept: " << (canAcceptFromLeader ? "YES" : "NO") << std::endl;
+                // std::cout << "[NETAGG_STALLED] No progress after " << noProgressCounter 
+                //          << " checks. Leader Match: " << leaderMatchIndex 
+                //          << ", F1 Match: " << followerMatchIndex[FOLLOWER1_RANK]
+                //          << ", F2 Match: " << followerMatchIndex[FOLLOWER2_RANK]
+                //          << ", Commit: " << netAggCommitIndex
+                //          << ", Pending: " << pendingEntriesMap.size() << std::endl;
             }
         }
         
         // *** PERIODIC HEALTH REPORTING ***
         auto currentTime = std::chrono::high_resolution_clock::now();
         auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
-        if (timeSinceStats.count() >= 30) {
-            std::cout << "[NETAGG_STATUS] Commit index: " << netAggCommitIndex 
-                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
-                     << ", Pending entries: " << pendingEntriesMap.size()
-                     << ", Follower1 match: " << followerMatchIndex[FOLLOWER1_RANK]
-                     << ", Follower2 match: " << followerMatchIndex[FOLLOWER2_RANK]
-                     << ", Progress checks: " << noProgressCounter << std::endl;
+        if (timeSinceStats.count() >= 30) {  // Every 30 seconds
+            // std::cout << "[NETAGG_STATUS] Commit index: " << netAggCommitIndex 
+            //          << ", Leader Match: " << leaderMatchIndex 
+            //          << ", F1 Match: " << followerMatchIndex[FOLLOWER1_RANK] 
+            //          << ", F2 Match: " << followerMatchIndex[FOLLOWER2_RANK]
+            //          << ", Pending: " << pendingEntriesMap.size() << std::endl;
             lastStatsTime = currentTime;
         }
         
-        // *** EMERGENCY CLEANUP FOR PENDING ENTRIES OVERFLOW ***
-        if (pendingEntriesMap.size() > 1000) {  // Emergency threshold
-            std::cout << "[NETAGG_WARNING] Pending entries overflow: " << pendingEntriesMap.size() 
-                     << ", forcing aggressive cleanup" << std::endl;
+        // *** EMERGENCY BUFFER OVERFLOW PROTECTION ***
+        if (pendingEntriesMap.size() > 1000) {  // 1000 entries
+            // std::cout << "[NETAGG_WARNING] Pending entries overflow: " << pendingEntriesMap.size() 
+            //          << ", forcing cleanup" << std::endl;
             
             // Force multiple cleanup cycles
             for (int i = 0; i < 5; i++) {
                 checkCompletedSends();
             }
             
-            // Consider dropping very old pending entries if system is truly stuck
+            // If still problematic, drop oldest entries (emergency measure)
             if (pendingEntriesMap.size() > 1500) {
-                std::cout << "[NETAGG_EMERGENCY] Dropping oldest pending entries to prevent deadlock" << std::endl;
+                // std::cout << "[NETAGG_EMERGENCY] Dropping oldest pending entries to prevent deadlock" << std::endl;
                 auto it = pendingEntriesMap.begin();
                 int dropped = 0;
                 while (it != pendingEntriesMap.end() && dropped < 200) {
                     it = pendingEntriesMap.erase(it);
                     dropped++;
                 }
-                std::cout << "[NETAGG_EMERGENCY] Dropped " << dropped << " pending entries" << std::endl;
-            }
-        }
-        
-        // *** ULTRA-LOW LATENCY: Emergency commit for small pending entries when stalled ***
-        if (pendingEntriesMap.size() > 2 && noProgressCounter > 3000000) {  // Lowered from >10 and >5M - catch the 3-entry case faster
-            std::cout << "[NETAGG_LATENCY_EMERGENCY] Small pending entries (" << pendingEntriesMap.size() 
-                     << ") stuck for " << noProgressCounter << " checks - forcing commit" << std::endl;
-            
-            // Force commit all pending entries that we can
-            std::vector<AggCommitInfo> emergencyCommits;
-            for (const auto& [index, pendingEntry] : pendingEntriesMap) {
-                if (index > netAggCommitIndex) {
-                    emergencyCommits.push_back({index, pendingEntry.entryTerm});
-                    if (emergencyCommits.size() >= 50) break;  // Limit batch size
-                }
+                // std::cout << "[NETAGG_EMERGENCY] Dropped " << dropped << " pending entries" << std::endl;
             }
             
-            if (!emergencyCommits.empty()) {
-                // Sort by index to commit in order
-                std::sort(emergencyCommits.begin(), emergencyCommits.end(), 
-                         [](const AggCommitInfo& a, const AggCommitInfo& b) {
-                             return a.commitIndex < b.commitIndex;
-                         });
-                
-                // Add to commit buffer
-                aggCommitBuffer.insert(aggCommitBuffer.end(), emergencyCommits.begin(), emergencyCommits.end());
-                
-                // Update commit index to the highest we're committing
-                netAggCommitIndex = emergencyCommits.back().commitIndex;
-                
-                // Clean up the committed entries
-                auto map_it = pendingEntriesMap.begin();
-                while (map_it != pendingEntriesMap.end()) {
-                    if (map_it->first <= netAggCommitIndex) {
-                        map_it = pendingEntriesMap.erase(map_it);
-                    } else {
-                        ++map_it;
-                    }
-                }
-                
-                std::cout << "[NETAGG_LATENCY_EMERGENCY] Force committed " << emergencyCommits.size() 
-                         << " entries up to index " << netAggCommitIndex << std::endl;
-                progress_made = true;
+            // *** ULTRA-LOW LATENCY: More aggressive action for small pending counts ***
+            if (pendingEntriesMap.size() < 100 && pendingEntriesMap.size() > 50) {
+                // std::cout << "[NETAGG_LATENCY_EMERGENCY] Small pending entries (" << pendingEntriesMap.size() 
+                //          << "), forcing immediate processing" << std::endl;
             }
         }
         
@@ -180,17 +143,17 @@ void NetAgg::run(bool& shutdown_flag) {
                 syncWarningCounter++;
                 
                 if (syncWarningCounter % 100 == 1) {  // Log first and every 100th
-                    std::cout << "[NETAGG_SYNC_WARNING] Followers out of sync - F1: " 
-                             << followerMatchIndex[FOLLOWER1_RANK] << ", F2: " 
-                             << followerMatchIndex[FOLLOWER2_RANK] << ", diff: " 
-                             << syncDiff << " (warning #" << syncWarningCounter << ")" << std::endl;
+                    // std::cout << "[NETAGG_SYNC_WARNING] Followers out of sync - F1: " 
+                    //          << followerMatchIndex[FOLLOWER1_RANK] << ", F2: " 
+                    //          << followerMatchIndex[FOLLOWER2_RANK] << ", diff: " 
+                    //          << syncDiff << " (warning #" << syncWarningCounter << ")" << std::endl;
                 }
                 
                 // *** ENHANCED STALL LOGGING ***
                 if (syncWarningCounter % 1000 == 1) {  // Less frequent for this case
-                    std::cout << "[NETAGG_FOLLOWER_BEHIND] Slow follower is missing commits. "
-                             << "NetAgg: " << netAggCommitIndex << ", Slow follower: " << minFollowerMatch 
-                             << ". Follower may need to request missing entries." << std::endl;
+                    // std::cout << "[NETAGG_FOLLOWER_BEHIND] Slow follower is missing commits. "
+                    //          << "NetAgg: " << netAggCommitIndex << ", Slow follower: " << minFollowerMatch 
+                    //          << ". Follower may need to request missing entries." << std::endl;
                 }
                 
                 // *** IMMEDIATE RECOVERY: For the exact stuck scenario we're seeing ***
@@ -199,10 +162,10 @@ void NetAgg::run(bool& shutdown_flag) {
                     int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
                                       ? FOLLOWER1_RANK : FOLLOWER2_RANK;
                     
-                    std::cout << "[NETAGG_IMMEDIATE_RECOVERY] Persistent small difference detected - forcing sync. "
-                             << "Slow follower " << slowFollower << " from " << followerMatchIndex[slowFollower] 
-                             << " to " << (maxFollowerMatch - 50) << " (diff=" << syncDiff 
-                             << ", stuck for " << syncWarningCounter << " attempts)" << std::endl;
+                    // std::cout << "[NETAGG_IMMEDIATE_RECOVERY] Persistent small difference detected - forcing sync. "
+                    //          << "Slow follower " << slowFollower << " from " << followerMatchIndex[slowFollower] 
+                    //          << " to " << (maxFollowerMatch - 50) << " (diff=" << syncDiff 
+                    //          << ", stuck for " << syncWarningCounter << " attempts)" << std::endl;
                     
                     followerMatchIndex[slowFollower] = maxFollowerMatch - 50;
                     syncWarningCounter = 0;
@@ -225,10 +188,10 @@ void NetAgg::run(bool& shutdown_flag) {
                     int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
                                       ? FOLLOWER1_RANK : FOLLOWER2_RANK;
                     
-                    std::cout << "[NETAGG_FORCE_SYNC] Force syncing slow follower " << slowFollower 
-                             << " from " << followerMatchIndex[slowFollower] 
-                             << " to " << (maxFollowerMatch - 100) << " (diff=" << syncDiff 
-                             << ", attempts=" << syncWarningCounter << ")" << std::endl;
+                    // std::cout << "[NETAGG_FORCE_SYNC] Force syncing slow follower " << slowFollower 
+                    //          << " from " << followerMatchIndex[slowFollower] 
+                    //          << " to " << (maxFollowerMatch - 100) << " (diff=" << syncDiff 
+                    //          << ", attempts=" << syncWarningCounter << ")" << std::endl;
                     
                     followerMatchIndex[slowFollower] = maxFollowerMatch - 100;  // Smaller gap
                     syncWarningCounter = 0;  // Reset after force sync
@@ -237,8 +200,8 @@ void NetAgg::run(bool& shutdown_flag) {
                 
                 // *** SUPER AGGRESSIVE: If stuck for extremely long time ***
                 if (syncWarningCounter > 10000) {  // Much lower threshold - was 3000
-                    std::cout << "[NETAGG_SUPER_RECOVERY] System stuck for " << syncWarningCounter 
-                             << " attempts (diff=" << syncDiff << "), force syncing both followers" << std::endl;
+                    // std::cout << "[NETAGG_SUPER_RECOVERY] System stuck for " << syncWarningCounter 
+                    //          << " attempts (diff=" << syncDiff << "), force syncing both followers" << std::endl;
                     
                     // Set both followers to the same position near the max
                     int syncTarget = maxFollowerMatch - 50;  // Very small gap
@@ -252,8 +215,8 @@ void NetAgg::run(bool& shutdown_flag) {
                             aggCommitBuffer.push_back({idx, currentLeaderTerm});
                         }
                         netAggCommitIndex = syncTarget;
-                        std::cout << "[NETAGG_SUPER_RECOVERY] Force committed " << commitCount 
-                                 << " entries up to " << syncTarget << std::endl;
+                        // std::cout << "[NETAGG_SUPER_RECOVERY] Force committed " << commitCount 
+                        //          << " entries up to " << syncTarget << std::endl;
                     }
                     
                     syncWarningCounter = 0;
@@ -262,17 +225,17 @@ void NetAgg::run(bool& shutdown_flag) {
                 
                 // *** CRITICAL DESYNC: Consider one follower broken ***
                 if (syncDiff > 100000) {
-                    std::cout << "[NETAGG_CRITICAL_DESYNC] One follower may be broken (diff=" 
-                             << syncDiff << "), considering single-follower operation" << std::endl;
+                    // std::cout << "[NETAGG_CRITICAL_DESYNC] One follower may be broken (diff=" 
+                    //          << syncDiff << "), considering single-follower operation" << std::endl;
                     
                     // *** EMERGENCY: If the gap is too large, reset the slow follower's match index ***
                     if (syncDiff > 500000) {
                         int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
                                           ? FOLLOWER1_RANK : FOLLOWER2_RANK;
                         
-                        std::cout << "[NETAGG_FOLLOWER_RESET] Resetting match index for slow follower " 
-                                 << slowFollower << " from " << followerMatchIndex[slowFollower] 
-                                 << " to " << (maxFollowerMatch - 1000) << std::endl;
+                        // std::cout << "[NETAGG_FOLLOWER_RESET] Resetting match index for slow follower " 
+                        //          << slowFollower << " from " << followerMatchIndex[slowFollower] 
+                        //          << " to " << (maxFollowerMatch - 1000) << std::endl;
                         
                         followerMatchIndex[slowFollower] = maxFollowerMatch - 1000;  // Give it a chance to catch up
                         syncWarningCounter = 0;

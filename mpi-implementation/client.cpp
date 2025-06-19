@@ -43,7 +43,11 @@
 //}
 
 // Constructor: initialize thread-related members
-Client::Client() : rank(CLIENT_RANK), rng(std::random_device{}()), processedRequestCount(0), stopReceiverFlag(false), noProgressCounter(0) {
+Client::Client(int clientRank) : rank(clientRank), rng(std::random_device{}()), processedRequestCount(0), stopReceiverFlag(false), noProgressCounter(0) {
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    this->rank = clientRank;  // Override with passed rank
+    
+    // std::cout << "[CLIENT" << rank << "] Created successfully" << std::endl;
     servers = {LEADER_RANK, FOLLOWER1_RANK, FOLLOWER2_RANK};
     serverDist = std::uniform_int_distribution<int>(0, static_cast<int>(servers.size()) - 1);
 }
@@ -101,13 +105,13 @@ void Client::receiverLoop() {
                 size_t pendingCount = pendingRequests.size();
                 lock.unlock();
                 
-                std::cout << "[CLIENT_THREAD_STALLED] No progress after " << noProgressCounter 
-                         << " checks. Last response " << timeSinceLastResponse.count() 
-                         << "s ago. Pending: " << pendingCount << std::endl;
+                // std::cout << "[CLIENT_THREAD_STALLED] No progress after " << noProgressCounter 
+                //          << " checks. Last response " << timeSinceLastResponse.count() 
+                //          << "s ago. Pending: " << pendingCount << std::endl;
                 
                 // *** STALL RECOVERY: Reset probe delay to be more aggressive ***
                 if (timeSinceLastResponse.count() > 5 && pendingCount > 0) {
-                    std::cout << "[CLIENT_RECEIVER_RECOVERY] Resetting to aggressive probing" << std::endl;
+                    // std::cout << "[CLIENT_RECEIVER_RECOVERY] Resetting to aggressive probing" << std::endl;
                     adaptiveProbeDelay = 0;
                     consecutiveEmptyProbes = 0;
                 }
@@ -129,9 +133,9 @@ void Client::receiverLoop() {
                         currentTime - it->second.startTime);
                     
                     if (responseTime.count() > 20) {  // 20 second timeout in receiver
-                        std::cout << "[CLIENT_RECEIVER_TIMEOUT] Clearing request " << it->first 
-                                 << " assigned to server " << it->second.respondTo
-                                 << " after " << responseTime.count() << "s" << std::endl;
+                        // std::cout << "[CLIENT_RECEIVER_TIMEOUT] Clearing request " << it->first 
+                        //          << " assigned to server " << it->second.respondTo
+                        //          << " after " << responseTime.count() << "s" << std::endl;
                         receiverTimeoutsByServer[it->second.respondTo]++;
                         it = pendingRequests.erase(it);
                         clearedInReceiver++;
@@ -141,15 +145,15 @@ void Client::receiverLoop() {
                 }
                 
                 if (clearedInReceiver > 0) {
-                    std::cout << "[CLIENT_RECEIVER_CLEARED] Removed " << clearedInReceiver 
-                             << " timed out requests" << std::endl;
+                    // std::cout << "[CLIENT_RECEIVER_CLEARED] Removed " << clearedInReceiver 
+                    //          << " timed out requests" << std::endl;
                     
                     // *** REPORT RECEIVER TIMEOUT PATTERNS ***
-                    std::cout << "[CLIENT_RECEIVER_TIMEOUT_ANALYSIS] Receiver timeouts by server: ";
-                    for (const auto& [server, count] : receiverTimeoutsByServer) {
-                        std::cout << "Server" << server << ":" << count << " ";
-                    }
-                    std::cout << std::endl;
+                    // std::cout << "[CLIENT_RECEIVER_TIMEOUT_ANALYSIS] Receiver timeouts by server: ";
+                    // for (const auto& [server, count] : receiverTimeoutsByServer) {
+                    //     std::cout << "Server" << server << ":" << count << " ";
+                    // }
+                    // std::cout << std::endl;
                 }
             }
             lock.unlock();
@@ -165,6 +169,7 @@ void Client::receiverLoop() {
 }
 
 void Client::run(int numRequests) {
+    // std::cout << "[CLIENT" << rank << "] Starting with " << numRequests << " requests" << std::endl;
     log_debug("CLIENT", "Started with rank " + std::to_string(rank));
 
     // +++ Initialize MPI Tool Interface +++
@@ -206,15 +211,15 @@ void Client::run(int numRequests) {
             
             // *** GRADUATED RESPONSE TO SEND BACKPRESSURE ***
             if (consecutiveStallChecks == SLOW_SYSTEM_THRESHOLD) {
-                std::cout << "[CLIENT_SEND_SLOW] Send queue backlogged, outstanding=" 
-                         << outstandingSends.size() << " (limit=" << ADAPTIVE_SEND_LIMIT << ")" << std::endl;
+                // std::cout << "[CLIENT_SEND_SLOW] Send queue backlogged, outstanding=" 
+                //          << outstandingSends.size() << " (limit=" << ADAPTIVE_SEND_LIMIT << ")" << std::endl;
             }
             
             // If stalled too long, force progress by reducing limits
             if (consecutiveStallChecks > MAX_STALL_CHECKS) {
-                std::cout << "[CLIENT_SEND_FORCE] Send queue critically stalled after " 
-                         << consecutiveStallChecks << " checks, outstanding=" 
-                         << outstandingSends.size() << std::endl;
+                // std::cout << "[CLIENT_SEND_FORCE] Send queue critically stalled after " 
+                //          << consecutiveStallChecks << " checks, outstanding=" 
+                //          << outstandingSends.size() << std::endl;
                 break;  // Force send anyway
             }
             
@@ -241,16 +246,16 @@ void Client::run(int numRequests) {
             
             // *** GRADUATED RESPONSE TO BACKPRESSURE ***
             if (consecutiveStallChecks == SLOW_SYSTEM_THRESHOLD) {
-                std::cout << "[CLIENT_SLOW_SYSTEM] System responding slowly, pending=" 
-                         << pending << ", adapting..." << std::endl;
+                // std::cout << "[CLIENT" << rank << "_SLOW_SYSTEM] System responding slowly, pending=" 
+                //          << pending << ", adapting..." << std::endl;
                 // Increase delay to give system time to catch up
                 baseRequestDelay = std::min(baseRequestDelay + 50.0, MAX_REQUEST_DELAY);
             }
             
             if (consecutiveStallChecks > MAX_STALL_CHECKS) {
-                std::cout << "[CLIENT_FORCE_SEND] True stall detected after " 
-                         << consecutiveStallChecks << " checks, pending=" << pending 
-                         << " (limit=" << MAX_PENDING_REQUESTS << ")" << std::endl;
+                // std::cout << "[CLIENT_FORCE_SEND] True stall detected after " 
+                //          << consecutiveStallChecks << " checks, pending=" << pending 
+                //          << " (limit=" << MAX_PENDING_REQUESTS << ")" << std::endl;
                 break;
             }
             
@@ -274,15 +279,15 @@ void Client::run(int numRequests) {
                 size_t pending = pendingRequests.size();
                 lock.unlock();
                 
-                std::cout << "[CLIENT_STALL_ANALYSIS] " << stallDuration.count() 
-                         << "ms stall - Outstanding: " << outstandingSends.size() 
-                         << "/" << ADAPTIVE_SEND_LIMIT << ", Pending: " << pending 
-                         << "/" << MAX_PENDING_REQUESTS << std::endl;
+                // std::cout << "[CLIENT_STALL_ANALYSIS] " << stallDuration.count() 
+                //          << "ms stall - Outstanding: " << outstandingSends.size() 
+                //          << "/" << ADAPTIVE_SEND_LIMIT << ", Pending: " << pending 
+                //          << "/" << MAX_PENDING_REQUESTS << std::endl;
                 
                 // *** ULTRA-LOW LATENCY: More aggressive timeout for small pending counts ***
                 if (pending < 50 && stallDuration.count() > 1000) {  // Small numbers stuck for 1s
-                    std::cout << "[CLIENT_LATENCY_EMERGENCY] Small request count (" << pending 
-                             << ") stuck for " << stallDuration.count() << "ms - forcing faster timeout" << std::endl;
+                    // std::cout << "[CLIENT_LATENCY_EMERGENCY] Small request count (" << pending 
+                    //          << ") stuck for " << stallDuration.count() << "ms - forcing faster timeout" << std::endl;
                     baseRequestDelay = std::min(baseRequestDelay + 50.0, MAX_REQUEST_DELAY);
                     consecutiveStallChecks = consecutiveStallChecks / 4;  // More aggressive reset
                     lastProgressTime = currentTime;
@@ -324,10 +329,10 @@ void Client::run(int numRequests) {
                         now - it->second.startTime);
                     
                     if (responseTime.count() > 30) {  // 30 second timeout
-                        std::cout << "[CLIENT_TIMEOUT] Request " << it->first 
-                                 << " assigned to server " << it->second.respondTo
-                                 << " timed out after " << responseTime.count() 
-                                 << "s, removing" << std::endl;
+                        // std::cout << "[CLIENT_TIMEOUT] Request " << it->first 
+                        //          << " assigned to server " << it->second.respondTo
+                        //          << " timed out after " << responseTime.count() 
+                        //          << "s, removing" << std::endl;
                         timeoutsByServer[it->second.respondTo]++;
                         it = pendingRequests.erase(it);
                         timedOutRequests++;
@@ -338,25 +343,25 @@ void Client::run(int numRequests) {
                 
                 // *** REPORT TIMEOUT PATTERNS ***
                 if (timedOutRequests > 0) {
-                    std::cout << "[CLIENT_TIMEOUT_ANALYSIS] Timeouts by server: ";
-                    for (const auto& [server, count] : timeoutsByServer) {
-                        std::cout << "Server" << server << ":" << count << " ";
-                    }
-                    std::cout << std::endl;
+                    // std::cout << "[CLIENT_TIMEOUT_ANALYSIS] Timeouts by server: ";
+                    // for (const auto& [server, count] : timeoutsByServer) {
+                    //     std::cout << "Server" << server << ":" << count << " ";
+                    // }
+                    // std::cout << std::endl;
                 }
             }
             lock.unlock();
             
             // *** ENHANCED PROGRESS REPORT ***
-            std::cout << "[CLIENT_PROGRESS] Sent: " << i << "/" << numRequests 
-                     << " | Pending: " << (pending - timedOutRequests) << "/" << MAX_PENDING_REQUESTS
-                     << " | Outstanding: " << outstandingSends.size() << "/" << ADAPTIVE_SEND_LIMIT
-                     << " | Delay: " << baseRequestDelay << "μs"
-                     << " | Stall checks: " << consecutiveStallChecks;
-            if (timedOutRequests > 0) {
-                std::cout << " | Timed out: " << timedOutRequests;
-            }
-            std::cout << std::endl;
+            // std::cout << "[CLIENT" << rank << "_PROGRESS] Sent: " << i << "/" << numRequests 
+            //          << " | Pending: " << (pending - timedOutRequests) << "/" << MAX_PENDING_REQUESTS
+            //          << " | Outstanding: " << outstandingSends.size() << "/" << ADAPTIVE_SEND_LIMIT
+            //          << " | Delay: " << baseRequestDelay << "μs"
+            //          << " | Stall checks: " << consecutiveStallChecks;
+            // if (timedOutRequests > 0) {
+            //     std::cout << " | Timed out: " << timedOutRequests;
+            // }
+            // std::cout << std::endl;
             lastStatsTime = currentTime;
         }
     }
@@ -392,10 +397,10 @@ void Client::run(int numRequests) {
                 int timeoutThreshold = (pending_count < 50) ? 8 : 15;  // Faster timeout for small counts
                 
                 if (responseTime.count() > timeoutThreshold) {
-                    std::cout << "[CLIENT_WAIT_TIMEOUT] Request " << it->first 
-                             << " assigned to server " << it->second.respondTo
-                             << " timed out after " << responseTime.count() 
-                             << "s during wait (threshold=" << timeoutThreshold << "), removing" << std::endl;
+                    // std::cout << "[CLIENT_WAIT_TIMEOUT] Request " << it->first 
+                    //          << " assigned to server " << it->second.respondTo
+                    //          << " timed out after " << responseTime.count() 
+                    //          << "s during wait (threshold=" << timeoutThreshold << "), removing" << std::endl;
                     waitTimeoutsByServer[it->second.respondTo]++;
                     it = pendingRequests.erase(it);
                     timedOutInWait++;
@@ -405,15 +410,15 @@ void Client::run(int numRequests) {
             }
             
             if (timedOutInWait > 0) {
-                std::cout << "[CLIENT_WAIT_RECOVERY] Removed " << timedOutInWait 
-                         << " timed out requests, continuing..." << std::endl;
+                // std::cout << "[CLIENT_WAIT_RECOVERY] Removed " << timedOutInWait 
+                //          << " timed out requests, continuing..." << std::endl;
                 
                 // *** REPORT WAIT TIMEOUT PATTERNS ***
-                std::cout << "[CLIENT_WAIT_TIMEOUT_ANALYSIS] Wait timeouts by server: ";
-                for (const auto& [server, count] : waitTimeoutsByServer) {
-                    std::cout << "Server" << server << ":" << count << " ";
-                }
-                std::cout << std::endl;
+                // std::cout << "[CLIENT_WAIT_TIMEOUT_ANALYSIS] Wait timeouts by server: ";
+                // for (const auto& [server, count] : waitTimeoutsByServer) {
+                //     std::cout << "Server" << server << ":" << count << " ";
+                // }
+                // std::cout << std::endl;
                 
                 pending_count = pendingRequests.size();  // Update count
             }
@@ -425,20 +430,20 @@ void Client::run(int numRequests) {
         if (wait_counter > 0 && wait_counter % 1000000 == 0) {  // Report more frequently
             auto waitTime = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - waitStartTime);
-            std::cout << "[CLIENT_WAIT_LOOP_STATUS] Still waiting for " << pending_count 
-                     << " responses after " << waitTime.count() << "s..." << std::endl;
+            // std::cout << "[CLIENT_WAIT_LOOP_STATUS] Still waiting for " << pending_count 
+            //          << " responses after " << waitTime.count() << "s..." << std::endl;
         }
         
         // *** DEADLOCK DETECTION: Shorter timeout for critical stall detection ***
         if (wait_counter > 10000000) {  // Reduced from 50M - detect faster
             auto waitTime = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - waitStartTime);
-            std::cout << "[CLIENT_POTENTIAL_DEADLOCK] System may be deadlocked after " 
-                     << waitTime.count() << "s, " << pending_count << " responses missing" << std::endl;
+            // std::cout << "[CLIENT_POTENTIAL_DEADLOCK] System may be deadlocked after " 
+            //          << waitTime.count() << "s, " << pending_count << " responses missing" << std::endl;
             
             // *** EMERGENCY RECOVERY: Clear all pending if system appears completely stuck ***
             if (waitTime.count() > 60) {  // 1 minute of waiting
-                std::cout << "[CLIENT_EMERGENCY_RECOVERY] Clearing all pending requests after 60s deadlock" << std::endl;
+                // std::cout << "[CLIENT_EMERGENCY_RECOVERY] Clearing all pending requests after 60s deadlock" << std::endl;
                 std::unique_lock<std::recursive_mutex> emergencyLock(dataMutex);
                 pendingRequests.clear();
                 emergencyLock.unlock();
@@ -456,8 +461,8 @@ void Client::run(int numRequests) {
         auto cleanupTime = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::high_resolution_clock::now() - cleanupStartTime);
         if (cleanupTime.count() > 30) {  // 30 second timeout for cleanup
-            std::cout << "[CLIENT_CLEANUP_TIMEOUT] Forcing cleanup after 30s, " 
-                     << outstandingSends.size() << " sends remaining" << std::endl;
+            // std::cout << "[CLIENT_CLEANUP_TIMEOUT] Forcing cleanup after 30s, " 
+            //          << outstandingSends.size() << " sends remaining" << std::endl;
             break;
         }
     }
@@ -545,7 +550,7 @@ void Client::handleResponse(MPI_Status& status) {
 
             processedRequestCount++;
             if ((processedRequestCount % STATS_INTERVAL) == 0) {
-                std::cout << "\n--- Statistics for interval ending at " << processedRequestCount << " total requests ---" << std::endl;
+                std::cout << "\n--- Client " << rank << " Statistics for interval ending at " << processedRequestCount << " total requests ---" << std::endl;
                 printStatistics();
                 latencies.clear();
             }
@@ -557,7 +562,7 @@ void Client::printStatistics() {
     std::lock_guard<std::recursive_mutex> lock(dataMutex);
 
     if (latencies.empty()) {
-        std::cout << "\n=== Latency Statistics (ms) ===" << std::endl;
+        std::cout << "\n=== Client " << rank << " Latency Statistics (ms) ===" << std::endl;
         std::cout << "No responses received." << std::endl;
         std::cout << "==============================\n" << std::endl;
         return;
@@ -576,7 +581,7 @@ void Client::printStatistics() {
     double p90 = latencies_to_print.empty() ? 0 : latencies_to_print[static_cast<size_t>(latencies_to_print.size() * 0.90)];
     double p99 = latencies_to_print.empty() ? 0 : latencies_to_print[static_cast<size_t>(latencies_to_print.size() * 0.99)];
 
-    std::cout << "\n=== Latency Statistics (ms) ===" << std::endl;
+    std::cout << "\n=== Client " << rank << " Latency Statistics (ms) ===" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "Requests processed: " << latencies_to_print.size() << std::endl;
     std::cout << "Average: " << avgLat << std::endl;

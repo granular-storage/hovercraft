@@ -1,0 +1,3371 @@
+
+=== FILE: Makefile ===
+
+# Makefile for HoverCraft++ prototype
+
+CXX = mpic++
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pthread
+TARGET = hovercraft_demo
+
+# Component source files (separate compilation)
+COMP_SOURCES = switch_main.cpp leader_main.cpp follower_main.cpp netagg_main.cpp client_main.cpp main_driver.cpp
+HEADERS = common.hpp switch.hpp leader.hpp follower.hpp netagg.hpp client.hpp
+
+# Default target
+all: $(TARGET)
+
+# Build the main executable
+$(TARGET): main.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ main.cpp
+
+# Alternative: Build separate executables for each component
+separate: switch_exe leader_exe follower_exe netagg_exe client_exe
+
+switch_exe: switch_main.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -DSWITCH_MAIN -o switch switch_main.cpp
+
+leader_exe: leader_main.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -DLEADER_MAIN -o leader leader_main.cpp
+
+follower_exe: follower_main.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -DFOLLOWER_MAIN -o follower follower_main.cpp
+
+netagg_exe: netagg_main.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -DNETAGG_MAIN -o netagg netagg_main.cpp
+
+client_exe: client_main.cpp common.hpp
+	$(CXX) $(CXXFLAGS) -DCLIENT_MAIN -o client client_main.cpp
+
+# Run with default 100 requests
+run: $(TARGET)
+	mpirun -np 6 ./$(TARGET) 100
+
+# Run with custom number of requests
+run-custom: $(TARGET)
+	@echo "Usage: make run-custom REQUESTS=<number>"
+	mpirun -np 6 ./$(TARGET) $(REQUESTS)
+
+# Run with verbose output
+run-verbose: $(TARGET)
+	mpirun -np 6 -v ./$(TARGET) 100
+
+# Clean build artifacts
+clean:
+	rm -f $(TARGET) switch_exe leader_exe follower_exe netagg_exe client_exe *.o
+
+# Help target
+help:
+	@echo "Available targets:"
+	@echo "  all         - Build the main HoverCraft++ demo executable"
+	@echo "  run         - Run with 100 requests"
+	@echo "  run-custom  - Run with custom number of requests (REQUESTS=n)"
+	@echo "  run-verbose - Run with verbose MPI output"
+	@echo "  clean       - Remove all build artifacts"
+	@echo "  help        - Show this help message"
+
+# Phony targets
+.PHONY: all run run-custom run-verbose clean help separate
+=== END OF Makefile ===
+
+
+=== FILE: client.cpp ===
+
+#include "client.hpp"
+#include <vector>
+#include <mutex> // For std::lock_guard
+#include <thread> // For std::this_thread::sleep_for
+#include <map>
+
+// --- Session handle for MPI_T, global to this file ---
+//MPI_T_pvar_session pvar_session;
+
+//void printMpiPvar(const char* pvar_name) {
+//    int pvar_index = -1;
+//    // We only need to search the state class, as that's where these PVars live.
+//    int err = MPI_T_pvar_get_index(pvar_name, MPI_T_PVAR_CLASS_STATE, &pvar_index);
+//
+//    if (err != MPI_SUCCESS || pvar_index < 0) {
+//        // PVar not found. This is normal if a component (like ucx) isn't used.
+//        return;
+//    }
+//
+//    MPI_T_pvar_handle pvar_handle;
+//    int count;
+//    err = MPI_T_pvar_handle_alloc(pvar_session, pvar_index, NULL, &pvar_handle, &count);
+//    if (err != MPI_SUCCESS) return;
+//
+//    MPI_T_pvar_start(pvar_session, pvar_handle);
+//
+//    // --- CRITICAL FIX: Use the correct data type found by ompi_info ---
+//    unsigned int pvar_value;
+//    MPI_T_pvar_read(pvar_session, pvar_handle, &pvar_value);
+//
+//    // Use std::flush to force output immediately
+//    std::cout << "[CLIENT_MPI_STATE] " << pvar_name << ": " << pvar_value << std::flush;
+//    std::cout << std::endl;
+//
+//    MPI_T_pvar_stop(pvar_session, pvar_handle);
+//    MPI_T_pvar_handle_free(pvar_session, &pvar_handle);
+//}
+
+// +++ FUNCTION updated with the correct PVar names for your system +++
+//void logMpiState() {
+//    printMpiPvar("pml_ob1_unexpected_msgq_length");
+//    printMpiPvar("pml_ob1_send_queue_length");
+//}
+
+// Constructor: initialize thread-related members
+Client::Client() : rank(CLIENT_RANK), rng(std::random_device{}()), processedRequestCount(0), stopReceiverFlag(false), noProgressCounter(0) {
+    servers = {LEADER_RANK, FOLLOWER1_RANK, FOLLOWER2_RANK};
+    serverDist = std::uniform_int_distribution<int>(0, static_cast<int>(servers.size()) - 1);
+}
+
+// Destructor: ensure thread is stopped and resources are cleaned up
+Client::~Client() {
+    if (receiverThread.joinable()) {
+        stopReceiverFlag.store(true);
+        receiverThread.join();
+    }
+    for (auto& send : outstandingSends) {
+        delete[] send.buffer;
+    }
+}
+
+// The main function for the receiver thread
+void Client::receiverLoop() {
+    log_debug("CLIENT_THREAD", "Receiver thread started.");
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;  // Reduced from 10M for faster detection
+    
+    // *** ADAPTIVE RECEIVER IMPROVEMENTS ***
+    auto lastResponseTime = std::chrono::high_resolution_clock::now();
+    auto lastTimeoutCheck = lastResponseTime;
+    int adaptiveProbeDelay = 0;  // microseconds
+    const int MAX_PROBE_DELAY = 100;  // 100μs max delay between probes
+    int consecutiveEmptyProbes = 0;
+    
+    while (!stopReceiverFlag.load()) {
+        MPI_Status status;
+        int flag = 0;
+        MPI_Iprobe(MPI_ANY_SOURCE, CLIENT_RESPONSE, MPI_COMM_WORLD, &flag, &status);
+        
+        if (flag) {
+            handleResponse(status);
+            noProgressCounter = 0;
+            consecutiveEmptyProbes = 0;
+            lastResponseTime = std::chrono::high_resolution_clock::now();
+            adaptiveProbeDelay = 0;  // Reset delay on successful receive
+        } else {
+            noProgressCounter++;
+            consecutiveEmptyProbes++;
+            
+            // *** ADAPTIVE PROBING: Reduce CPU usage when no responses coming ***
+            if (consecutiveEmptyProbes > 1000) {
+                adaptiveProbeDelay = std::min(adaptiveProbeDelay + 1, MAX_PROBE_DELAY);
+                consecutiveEmptyProbes = 0;  // Reset counter
+            }
+            
+            // *** ENHANCED STALL DETECTION ***
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                auto timeSinceLastResponse = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::high_resolution_clock::now() - lastResponseTime);
+                
+                std::unique_lock<std::recursive_mutex> lock(dataMutex);
+                size_t pendingCount = pendingRequests.size();
+                lock.unlock();
+                
+                std::cout << "[CLIENT_THREAD_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Last response " << timeSinceLastResponse.count() 
+                         << "s ago. Pending: " << pendingCount << std::endl;
+                
+                // *** STALL RECOVERY: Reset probe delay to be more aggressive ***
+                if (timeSinceLastResponse.count() > 5 && pendingCount > 0) {
+                    std::cout << "[CLIENT_RECEIVER_RECOVERY] Resetting to aggressive probing" << std::endl;
+                    adaptiveProbeDelay = 0;
+                    consecutiveEmptyProbes = 0;
+                }
+            }
+        }
+        
+        // *** AGGRESSIVE TIMEOUT CLEARING IN RECEIVER THREAD ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceLastTimeoutCheck = std::chrono::duration_cast<std::chrono::seconds>(
+            currentTime - lastTimeoutCheck);
+        
+        if (timeSinceLastTimeoutCheck.count() >= 10) {  // Check every 10 seconds
+            std::unique_lock<std::recursive_mutex> lock(dataMutex);
+            if (!pendingRequests.empty()) {
+                int clearedInReceiver = 0;
+                std::map<int, int> receiverTimeoutsByServer;  // Track timeouts by assigned server
+                for (auto it = pendingRequests.begin(); it != pendingRequests.end(); ) {
+                    auto responseTime = std::chrono::duration_cast<std::chrono::seconds>(
+                        currentTime - it->second.startTime);
+                    
+                    if (responseTime.count() > 20) {  // 20 second timeout in receiver
+                        std::cout << "[CLIENT_RECEIVER_TIMEOUT] Clearing request " << it->first 
+                                 << " assigned to server " << it->second.respondTo
+                                 << " after " << responseTime.count() << "s" << std::endl;
+                        receiverTimeoutsByServer[it->second.respondTo]++;
+                        it = pendingRequests.erase(it);
+                        clearedInReceiver++;
+                    } else {
+                        ++it;
+                    }
+                }
+                
+                if (clearedInReceiver > 0) {
+                    std::cout << "[CLIENT_RECEIVER_CLEARED] Removed " << clearedInReceiver 
+                             << " timed out requests" << std::endl;
+                    
+                    // *** REPORT RECEIVER TIMEOUT PATTERNS ***
+                    std::cout << "[CLIENT_RECEIVER_TIMEOUT_ANALYSIS] Receiver timeouts by server: ";
+                    for (const auto& [server, count] : receiverTimeoutsByServer) {
+                        std::cout << "Server" << server << ":" << count << " ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+            lock.unlock();
+            lastTimeoutCheck = currentTime;
+        }
+        
+        // *** ADAPTIVE SLEEP: Reduce CPU usage when system is idle ***
+        if (adaptiveProbeDelay > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(adaptiveProbeDelay));
+        }
+    }
+    log_debug("CLIENT_THREAD", "Receiver thread stopping.");
+}
+
+void Client::run(int numRequests) {
+    log_debug("CLIENT", "Started with rank " + std::to_string(rank));
+
+    // +++ Initialize MPI Tool Interface +++
+    int provided;
+	MPI_T_init_thread(MPI_THREAD_MULTIPLE, &provided);
+	if (provided < MPI_THREAD_MULTIPLE) {
+		log_debug("CLIENT", "MPI does not provide MPI_THREAD_MULTIPLE support, which is required.");
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	}
+    // +++ Create a session for PVar access +++
+//    MPI_T_pvar_session_create(&pvar_session);
+
+    receiverThread = std::thread(&Client::receiverLoop, this);
+
+    // *** PROGRESS IMPROVEMENTS ***
+    // Reduce backpressure limits to keep pipeline flowing
+    const int MAX_PENDING_REQUESTS = 15 * BATCH_SIZE;  // Increased from 50 - was too aggressive
+    const int ADAPTIVE_SEND_LIMIT = 10;                // Increased from 50
+    const int MIN_REQUESTS_IN_FLIGHT = 5;              // Reduced from 10 - less conflict with max
+    
+    // Add timeout and adaptive mechanisms
+    auto lastProgressTime = std::chrono::high_resolution_clock::now();
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int consecutiveStallChecks = 0;
+    const int MAX_STALL_CHECKS = 5000000;  // Increased from 1M - less aggressive
+    const int SLOW_SYSTEM_THRESHOLD = 1000000;  // Detect slow system vs stalled
+    
+    // Adaptive request rate control
+    double baseRequestDelay = 0.0;  // microseconds between requests
+    const double MAX_REQUEST_DELAY = 1000.0;  // 1ms max delay
+
+    for (int i = 1; i <= numRequests; i++) {
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        
+        // *** ADAPTIVE BACKPRESSURE: Don't block completely ***
+        while (outstandingSends.size() >= ADAPTIVE_SEND_LIMIT) {
+            checkCompletedSends();
+            consecutiveStallChecks++;
+            
+            // *** GRADUATED RESPONSE TO SEND BACKPRESSURE ***
+            if (consecutiveStallChecks == SLOW_SYSTEM_THRESHOLD) {
+                std::cout << "[CLIENT_SEND_SLOW] Send queue backlogged, outstanding=" 
+                         << outstandingSends.size() << " (limit=" << ADAPTIVE_SEND_LIMIT << ")" << std::endl;
+            }
+            
+            // If stalled too long, force progress by reducing limits
+            if (consecutiveStallChecks > MAX_STALL_CHECKS) {
+                std::cout << "[CLIENT_SEND_FORCE] Send queue critically stalled after " 
+                         << consecutiveStallChecks << " checks, outstanding=" 
+                         << outstandingSends.size() << std::endl;
+                break;  // Force send anyway
+            }
+            
+            // *** EXPONENTIAL BACKOFF FOR SEND QUEUE ***
+            if (consecutiveStallChecks > SLOW_SYSTEM_THRESHOLD) {
+                int backoff_us = std::min(consecutiveStallChecks / 100000, 50);  // Max 50μs for sends
+                std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            }
+        }
+
+        // *** ADAPTIVE PENDING LIMIT: Keep minimum requests in flight ***
+        while (true) {
+            checkCompletedSends();
+            std::unique_lock<std::recursive_mutex> lock(dataMutex);
+            size_t pending = pendingRequests.size();
+            
+            // Allow sending if below limit OR if too few requests in flight
+            if (pending <= MAX_PENDING_REQUESTS || pending < MIN_REQUESTS_IN_FLIGHT) {
+                break;
+            }
+            lock.unlock();
+            
+            consecutiveStallChecks++;
+            
+            // *** GRADUATED RESPONSE TO BACKPRESSURE ***
+            if (consecutiveStallChecks == SLOW_SYSTEM_THRESHOLD) {
+                std::cout << "[CLIENT_SLOW_SYSTEM] System responding slowly, pending=" 
+                         << pending << ", adapting..." << std::endl;
+                // Increase delay to give system time to catch up
+                baseRequestDelay = std::min(baseRequestDelay + 50.0, MAX_REQUEST_DELAY);
+            }
+            
+            if (consecutiveStallChecks > MAX_STALL_CHECKS) {
+                std::cout << "[CLIENT_FORCE_SEND] True stall detected after " 
+                         << consecutiveStallChecks << " checks, pending=" << pending 
+                         << " (limit=" << MAX_PENDING_REQUESTS << ")" << std::endl;
+                break;
+            }
+            
+            // *** EXPONENTIAL BACKOFF: Wait longer as stall persists ***
+            if (consecutiveStallChecks > SLOW_SYSTEM_THRESHOLD) {
+                int backoff_us = std::min(consecutiveStallChecks / 100000, 100);  // Max 100μs
+                std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            }
+        }
+
+        // *** PROGRESS MONITORING: Detect and adapt to stalls ***
+        if (consecutiveStallChecks == 0) {
+            lastProgressTime = currentTime;
+        } else {
+            auto stallDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                currentTime - lastProgressTime);
+            
+            // *** ADAPTIVE STALL RESPONSE: Different behavior for different stall durations ***
+            if (stallDuration.count() > 2000) {  // 2 second stall - more conservative
+                std::unique_lock<std::recursive_mutex> lock(dataMutex);
+                size_t pending = pendingRequests.size();
+                lock.unlock();
+                
+                std::cout << "[CLIENT_STALL_ANALYSIS] " << stallDuration.count() 
+                         << "ms stall - Outstanding: " << outstandingSends.size() 
+                         << "/" << ADAPTIVE_SEND_LIMIT << ", Pending: " << pending 
+                         << "/" << MAX_PENDING_REQUESTS << std::endl;
+                
+                // *** ULTRA-LOW LATENCY: More aggressive timeout for small pending counts ***
+                if (pending < 50 && stallDuration.count() > 1000) {  // Small numbers stuck for 1s
+                    std::cout << "[CLIENT_LATENCY_EMERGENCY] Small request count (" << pending 
+                             << ") stuck for " << stallDuration.count() << "ms - forcing faster timeout" << std::endl;
+                    baseRequestDelay = std::min(baseRequestDelay + 50.0, MAX_REQUEST_DELAY);
+                    consecutiveStallChecks = consecutiveStallChecks / 4;  // More aggressive reset
+                    lastProgressTime = currentTime;
+                }
+                // Adaptive recovery: increase request delay more gradually
+                else {
+                    baseRequestDelay = std::min(baseRequestDelay + 25.0, MAX_REQUEST_DELAY);
+                    consecutiveStallChecks = consecutiveStallChecks / 2;  // Partial reset
+                    lastProgressTime = currentTime;
+                }
+            }
+        }
+
+        sendRequest(i);
+        checkCompletedSends();
+        consecutiveStallChecks = 0;  // Reset on successful send
+
+        // *** ADAPTIVE RATE CONTROL: Slow down if system is struggling ***
+        if (baseRequestDelay > 0.0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(static_cast<int>(baseRequestDelay)));
+            // Gradually reduce delay
+            baseRequestDelay = std::max(0.0, baseRequestDelay - 1.0);
+        }
+
+        // *** PERIODIC PROGRESS REPORTING ***
+        auto timeSinceLastStats = std::chrono::duration_cast<std::chrono::seconds>(
+            currentTime - lastStatsTime);
+        if (timeSinceLastStats.count() >= 10) {  // Every 10 seconds
+            std::unique_lock<std::recursive_mutex> lock(dataMutex);
+            size_t pending = pendingRequests.size();
+            
+            // *** TIMEOUT DETECTION FOR MISSING RESPONSES ***
+            int timedOutRequests = 0;
+            std::map<int, int> timeoutsByServer;  // Track timeouts by assigned server
+            if (pending > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                for (auto it = pendingRequests.begin(); it != pendingRequests.end(); ) {
+                    auto responseTime = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - it->second.startTime);
+                    
+                    if (responseTime.count() > 30) {  // 30 second timeout
+                        std::cout << "[CLIENT_TIMEOUT] Request " << it->first 
+                                 << " assigned to server " << it->second.respondTo
+                                 << " timed out after " << responseTime.count() 
+                                 << "s, removing" << std::endl;
+                        timeoutsByServer[it->second.respondTo]++;
+                        it = pendingRequests.erase(it);
+                        timedOutRequests++;
+                    } else {
+                        ++it;
+                    }
+                }
+                
+                // *** REPORT TIMEOUT PATTERNS ***
+                if (timedOutRequests > 0) {
+                    std::cout << "[CLIENT_TIMEOUT_ANALYSIS] Timeouts by server: ";
+                    for (const auto& [server, count] : timeoutsByServer) {
+                        std::cout << "Server" << server << ":" << count << " ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+            lock.unlock();
+            
+            // *** ENHANCED PROGRESS REPORT ***
+            std::cout << "[CLIENT_PROGRESS] Sent: " << i << "/" << numRequests 
+                     << " | Pending: " << (pending - timedOutRequests) << "/" << MAX_PENDING_REQUESTS
+                     << " | Outstanding: " << outstandingSends.size() << "/" << ADAPTIVE_SEND_LIMIT
+                     << " | Delay: " << baseRequestDelay << "μs"
+                     << " | Stall checks: " << consecutiveStallChecks;
+            if (timedOutRequests > 0) {
+                std::cout << " | Timed out: " << timedOutRequests;
+            }
+            std::cout << std::endl;
+            lastStatsTime = currentTime;
+        }
+    }
+
+    log_debug("CLIENT", "All requests initiated. Waiting for remaining responses...");
+
+    // *** IMPROVED WAIT LOOP: More aggressive completion checking ***
+    uint64_t wait_counter = 0;
+    auto waitStartTime = std::chrono::high_resolution_clock::now();
+    auto lastTimeoutCheck = waitStartTime;
+    
+    while (true) {
+        checkCompletedSends();
+        std::unique_lock<std::recursive_mutex> lock(dataMutex);
+        size_t pending_count = pendingRequests.size();
+        if (pending_count == 0) {
+            break;
+        }
+        
+        // *** AGGRESSIVE TIMEOUT CHECKING DURING WAIT ***
+        auto currentWaitTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceLastTimeoutCheck = std::chrono::duration_cast<std::chrono::seconds>(
+            currentWaitTime - lastTimeoutCheck);
+        
+        if (timeSinceLastTimeoutCheck.count() >= 5) {  // Check every 5 seconds during wait
+            int timedOutInWait = 0;
+            std::map<int, int> waitTimeoutsByServer;  // Track timeouts by assigned server
+            for (auto it = pendingRequests.begin(); it != pendingRequests.end(); ) {
+                auto responseTime = std::chrono::duration_cast<std::chrono::seconds>(
+                    currentWaitTime - it->second.startTime);
+                
+                // *** ULTRA-LOW LATENCY: More aggressive timeout for small counts ***
+                int timeoutThreshold = (pending_count < 50) ? 8 : 15;  // Faster timeout for small counts
+                
+                if (responseTime.count() > timeoutThreshold) {
+                    std::cout << "[CLIENT_WAIT_TIMEOUT] Request " << it->first 
+                             << " assigned to server " << it->second.respondTo
+                             << " timed out after " << responseTime.count() 
+                             << "s during wait (threshold=" << timeoutThreshold << "), removing" << std::endl;
+                    waitTimeoutsByServer[it->second.respondTo]++;
+                    it = pendingRequests.erase(it);
+                    timedOutInWait++;
+                } else {
+                    ++it;
+                }
+            }
+            
+            if (timedOutInWait > 0) {
+                std::cout << "[CLIENT_WAIT_RECOVERY] Removed " << timedOutInWait 
+                         << " timed out requests, continuing..." << std::endl;
+                
+                // *** REPORT WAIT TIMEOUT PATTERNS ***
+                std::cout << "[CLIENT_WAIT_TIMEOUT_ANALYSIS] Wait timeouts by server: ";
+                for (const auto& [server, count] : waitTimeoutsByServer) {
+                    std::cout << "Server" << server << ":" << count << " ";
+                }
+                std::cout << std::endl;
+                
+                pending_count = pendingRequests.size();  // Update count
+            }
+            lastTimeoutCheck = currentWaitTime;
+        }
+        lock.unlock();
+
+        wait_counter++;
+        if (wait_counter > 0 && wait_counter % 1000000 == 0) {  // Report more frequently
+            auto waitTime = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::high_resolution_clock::now() - waitStartTime);
+            std::cout << "[CLIENT_WAIT_LOOP_STATUS] Still waiting for " << pending_count 
+                     << " responses after " << waitTime.count() << "s..." << std::endl;
+        }
+        
+        // *** DEADLOCK DETECTION: Shorter timeout for critical stall detection ***
+        if (wait_counter > 10000000) {  // Reduced from 50M - detect faster
+            auto waitTime = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::high_resolution_clock::now() - waitStartTime);
+            std::cout << "[CLIENT_POTENTIAL_DEADLOCK] System may be deadlocked after " 
+                     << waitTime.count() << "s, " << pending_count << " responses missing" << std::endl;
+            
+            // *** EMERGENCY RECOVERY: Clear all pending if system appears completely stuck ***
+            if (waitTime.count() > 60) {  // 1 minute of waiting
+                std::cout << "[CLIENT_EMERGENCY_RECOVERY] Clearing all pending requests after 60s deadlock" << std::endl;
+                std::unique_lock<std::recursive_mutex> emergencyLock(dataMutex);
+                pendingRequests.clear();
+                emergencyLock.unlock();
+                break;  // Exit wait loop
+            }
+            
+            wait_counter = 0;  // Reset to avoid spam
+        }
+    }
+
+    // *** FINAL CLEANUP: Ensure all sends complete ***
+    auto cleanupStartTime = std::chrono::high_resolution_clock::now();
+    while (!outstandingSends.empty()) {
+        checkCompletedSends();
+        auto cleanupTime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::high_resolution_clock::now() - cleanupStartTime);
+        if (cleanupTime.count() > 30) {  // 30 second timeout for cleanup
+            std::cout << "[CLIENT_CLEANUP_TIMEOUT] Forcing cleanup after 30s, " 
+                     << outstandingSends.size() << " sends remaining" << std::endl;
+            break;
+        }
+    }
+
+    stopReceiverFlag.store(true);
+    receiverThread.join();
+
+    // +++ Free the session and finalize MPI_T +++
+//    MPI_T_pvar_session_free(&pvar_session);
+//    MPI_T_finalize();
+
+    printStatistics();
+}
+
+void Client::sendRequest(int value) {
+    int responderIndex = serverDist(rng);
+    int respondTo = servers[responderIndex];
+
+    std::string payload = "pv_" + std::to_string(value);
+    std::string msg_str = std::to_string(value) + "|" +
+                         std::to_string(respondTo) + "|" +
+                         payload;
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::recursive_mutex> lock(dataMutex);
+        pendingRequests[value] = {value, respondTo, startTime};
+    }
+
+    int msg_len = msg_str.length() + 1;
+    char* send_buffer = new char[msg_len];
+    strncpy(send_buffer, msg_str.c_str(), msg_len);
+
+    MPI_Request mpi_req;
+    // std::cout << "[CLIENT] SEND_REQ value=" << value << std::endl;
+    MPI_Isend(send_buffer, msg_len, MPI_CHAR, SWITCH_RANK,
+              CLIENT_REQUEST, MPI_COMM_WORLD, &mpi_req);
+
+    outstandingSends.push_back({mpi_req, send_buffer});
+}
+
+void Client::checkCompletedSends() {
+    if (outstandingSends.empty()) return;
+
+    auto it = outstandingSends.begin();
+    while (it != outstandingSends.end()) {
+        int flag = 0;
+        MPI_Test(&it->request, &flag, MPI_STATUS_IGNORE);
+        if (flag) {
+            delete[] it->buffer;
+            it = outstandingSends.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Client::handleResponse(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer_vec(msg_size);
+
+    MPI_Request recv_request;
+    MPI_Irecv(buffer_vec.data(), msg_size, MPI_CHAR, status.MPI_SOURCE, CLIENT_RESPONSE, MPI_COMM_WORLD, &recv_request);
+    MPI_Wait(&recv_request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer_vec.data(), msg_size - 1);
+
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.empty() || parts[0] != "SUCCESS" || parts.size() < 3 || (parts.size() - 1) % 2 != 0) {
+        return;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(dataMutex);
+
+    for (size_t i = 1; i < parts.size(); i += 2) {
+        int value = std::stoi(parts[i]);
+
+        auto it = pendingRequests.find(value);
+        if (it != pendingRequests.end()) {
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - it->second.startTime);
+            latencies.push_back(static_cast<double>(duration.count()) / 1000.0);
+            pendingRequests.erase(it);
+
+            processedRequestCount++;
+            if ((processedRequestCount % STATS_INTERVAL) == 0) {
+                std::cout << "\n--- Statistics for interval ending at " << processedRequestCount << " total requests ---" << std::endl;
+                printStatistics();
+                latencies.clear();
+            }
+        }
+    }
+}
+
+void Client::printStatistics() {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex);
+
+    if (latencies.empty()) {
+        std::cout << "\n=== Latency Statistics (ms) ===" << std::endl;
+        std::cout << "No responses received." << std::endl;
+        std::cout << "==============================\n" << std::endl;
+        return;
+    }
+
+    auto latencies_to_print = latencies;
+
+    double sum = 0.0;
+    for (double lat : latencies_to_print) sum += lat;
+    double avgLat = sum / latencies_to_print.size();
+
+    std::sort(latencies_to_print.begin(), latencies_to_print.end());
+    double minLat = latencies_to_print[0];
+    double maxLat = latencies_to_print.back();
+    double p50 = latencies_to_print[latencies_to_print.size() / 2];
+    double p90 = latencies_to_print.empty() ? 0 : latencies_to_print[static_cast<size_t>(latencies_to_print.size() * 0.90)];
+    double p99 = latencies_to_print.empty() ? 0 : latencies_to_print[static_cast<size_t>(latencies_to_print.size() * 0.99)];
+
+    std::cout << "\n=== Latency Statistics (ms) ===" << std::endl;
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Requests processed: " << latencies_to_print.size() << std::endl;
+    std::cout << "Average: " << avgLat << std::endl;
+    std::cout << "Min:     " << minLat << std::endl;
+    std::cout << "Max:     " << maxLat << std::endl;
+    std::cout << "P50 (Median): " << p50 << std::endl;
+    std::cout << "P90:     " << p90 << std::endl;
+    std::cout << "P99:     " << p99 << std::endl;
+    std::cout << "==============================\n" << std::endl;
+}
+
+=== END OF client.cpp ===
+
+
+=== FILE: client.hpp ===
+
+#ifndef CLIENT_HPP
+#define CLIENT_HPP
+
+#include "common.hpp"
+#include <random>
+#include <thread>
+#include <algorithm>
+#include <iomanip>
+#include <list>    // For managing outstanding sends
+#include <atomic>  // For thread-safe flag
+#include <mutex>   // For protecting shared data
+
+class Client {
+private:
+    int rank;
+    std::vector<int> servers;
+    std::mt19937 rng;
+    std::uniform_int_distribution<int> serverDist;
+
+    struct RequestTracker {
+        int value;
+        int respondTo;
+        std::chrono::high_resolution_clock::time_point startTime;
+    };
+
+    // --- Threading Members ---
+    // A recursive mutex allows a thread to re-lock a mutex it already holds.
+    // This is needed because handleResponse() (which holds the lock) calls
+    // printStatistics() (which also needs the lock).
+    std::recursive_mutex dataMutex;
+    std::map<int, RequestTracker> pendingRequests;
+    std::vector<double> latencies;
+    long long processedRequestCount;
+    std::thread receiverThread;
+    std::atomic<bool> stopReceiverFlag;
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
+    // Structure for non-blocking sends
+    struct OutstandingSend {
+        MPI_Request request;
+        char* buffer;
+    };
+    std::list<OutstandingSend> outstandingSends;
+
+    void sendRequest(int value);
+    void handleResponse(MPI_Status& status);
+    void printStatistics();
+    void checkCompletedSends();
+
+    // The function for the receiver thread
+    void receiverLoop();
+
+public:
+    Client();
+    ~Client(); // Destructor
+    void run(int numRequests);
+};
+
+#endif // CLIENT_HPP
+
+=== END OF client.hpp ===
+
+
+=== FILE: combine_files.sh ===
+
+#!/bin/bash
+
+# Script to combine all files in a directory into one single file
+# Usage: ./combine_files.sh [directory] [output_file]
+
+# Default values
+DIRECTORY=${1:-.}  # Current directory if not specified
+OUTPUT_FILE=${2:-combined_output.txt}  # Default output filename
+
+# Check if directory exists
+if [ ! -d "$DIRECTORY" ]; then
+    echo "Error: Directory '$DIRECTORY' does not exist."
+    exit 1
+fi
+
+# Remove output file if it already exists
+if [ -f "$OUTPUT_FILE" ]; then
+    rm "$OUTPUT_FILE"
+fi
+
+echo "Combining files from directory: $DIRECTORY"
+echo "Output file: $OUTPUT_FILE"
+echo "----------------------------------------"
+
+# Counter for files processed
+file_count=0
+
+# Loop through all files (not directories) in the specified directory
+for file in "$DIRECTORY"/*; do
+    # Skip if it's a directory or doesn't exist
+    if [ -d "$file" ] || [ ! -e "$file" ]; then
+        continue
+    fi
+    
+    # Get just the filename without path
+    filename=$(basename "$file")
+    
+    # Add separator and filename header to output
+    echo "" >> "$OUTPUT_FILE"
+    echo "=== FILE: $filename ===" >> "$OUTPUT_FILE"
+    echo "" >> "$OUTPUT_FILE"
+    
+    # Append file contents
+    cat "$file" >> "$OUTPUT_FILE"
+    
+    # Add separator after file contents
+    echo "" >> "$OUTPUT_FILE"
+    echo "=== END OF $filename ===" >> "$OUTPUT_FILE"
+    echo "" >> "$OUTPUT_FILE"
+    
+    ((file_count++))
+    echo "Processed: $filename"
+done
+
+echo "----------------------------------------"
+echo "Total files processed: $file_count"
+echo "Combined output saved to: $OUTPUT_FILE"
+
+=== END OF combine_files.sh ===
+
+
+=== FILE: common.hpp ===
+
+#ifndef COMMON_HPP
+#define COMMON_HPP
+
+#include <mpi.h>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <chrono>
+#include <iostream>
+#include <sstream> // For string splitting helper
+#include <cstring>
+#include <deque> // For fixed-size log
+#include <cstdint> // For uint64_t
+
+// MPI Tags for different message types
+enum MessageType {
+    CLIENT_REQUEST = 1,
+    SWITCH_REPLICATE = 2,
+    APPEND_ENTRIES_NETAGG_REQUEST = 3,
+    APPEND_ENTRIES_REQUEST = 4,
+    APPEND_ENTRIES_RESPONSE = 5,
+    AGG_COMMIT = 6,
+    CLIENT_RESPONSE = 7,
+    SHUTDOWN_SIGNAL = 99
+};
+
+// Component IDs (MPI ranks)
+enum ComponentID {
+    SWITCH_RANK = 0,
+    LEADER_RANK = 1,
+    FOLLOWER1_RANK = 2,
+    FOLLOWER2_RANK = 3,
+    NETAGG_RANK = 4,
+    CLIENT_RANK = 5
+};
+
+const int BATCH_SIZE = 1; // Max number of entries in a message batch
+const int LOG_MAX_SIZE = 1000; // Max number of entries to keep in server logs
+const int BATCH_TIMEOUT_MS = 5; // Reduced from 25ms - much more aggressive for low latency
+
+const int STATS_INTERVAL = 1000;
+
+const int MAX_OUTSTANDING_SENDS = 100; // Limit outstanding MPI sends
+
+// Request identifier
+struct RequestID {
+    int value;
+    int term;
+    
+    bool operator<(const RequestID& other) const {
+        if (term != other.term) return term < other.term;
+        return value < other.value;
+    }
+    
+    bool operator==(const RequestID& other) const {
+        return value == other.value && term == other.term;
+    }
+};
+
+// Log entry structure
+struct LogEntry {
+    int term;
+    int value;
+    std::string payload;
+    int clientRank;  // Who should respond to client
+    
+    LogEntry() : term(0), value(0), payload(""), clientRank(-1) {}
+    LogEntry(int t, int v, const std::string& p, int cr) 
+        : term(t), value(v), payload(p), clientRank(cr) {}
+};
+
+// Client request message
+struct ClientRequestMsg {
+    int value;
+    std::string payload;
+    int respondTo;  // Which server should respond
+    std::chrono::high_resolution_clock::time_point timestamp;
+};
+
+// Switch replicate message
+struct SwitchReplicateMsg {
+    RequestID id; // Contains Switch's term
+    std::string payload;
+    int clientRank;
+};
+
+// AppendEntries to NetAgg message
+struct AppendEntriesNetAggMsg {
+    int term;
+    int prevLogIndex; // Index of log entry immediately preceding the new ones (1-based)
+    int prevLogTerm;
+    int firstEntryIndex; // Index of the first entry in the batch (1-based)
+    std::string batchedEntryIds; // Serialized: "value1,term1;value2,term2;..." (terms are Leader's term)
+    int commitIndex; // Leader's commitIndex (0-based)
+    int source;
+};
+
+// AppendEntries from NetAgg to Followers
+struct AppendEntriesMsg {
+    int term;
+    int prevLogIndex;
+    int prevLogTerm;
+    int firstEntryIndex;
+    std::string batchedEntryIds; // Serialized: "value1,term1;value2,term2;..."
+    int commitIndex; // Leader's commitIndex (0-based)
+    int originalLeader;
+    int source;  // NetAgg
+};
+
+// AppendEntries response
+struct AppendEntriesResponseMsg {
+    int term;
+    bool success;
+    int matchIndex; // Highest log index known to be replicated on follower (1-based)
+    int source;
+    int dest;
+};
+
+// AggCommit message
+struct AggCommitMsg {
+    int commitIndex; // 1-based index
+    int term;
+    int source;
+};
+
+// Utility functions
+inline void log_debug(const std::string& component, const std::string& message) {
+    //std::cout << "[" << component << "] " << message << std::endl;
+}
+
+// New function for progress logging
+inline void log_progress_stalled(const std::string& component, uint64_t checks) {
+    std::cout << "[" << component << "_STALLED] No progress after "
+              << checks << " checks." << std::endl;
+}
+
+// Helper to split string by delimiter
+inline std::vector<std::string> split_string(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+// Helper to deserialize batchedEntryIds
+inline std::vector<RequestID> deserialize_batched_ids(const std::string& batched_str) {
+    std::vector<RequestID> ids;
+    if (batched_str.empty()) return ids;
+
+    std::vector<std::string> entry_tokens = split_string(batched_str, ';');
+    for (const auto& entry_token : entry_tokens) {
+        if (entry_token.empty()) continue;
+        std::vector<std::string> id_parts = split_string(entry_token, ',');
+        if (id_parts.size() == 2) {
+            try {
+                ids.push_back({std::stoi(id_parts[0]), std::stoi(id_parts[1])});
+            } catch (const std::exception& e) {
+                // log error or handle malformed string
+            }
+        }
+    }
+    return ids;
+}
+
+// Helper to serialize batchedEntryIds
+inline std::string serialize_batched_ids(const std::vector<RequestID>& ids) {
+    std::string s;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        s += std::to_string(ids[i].value) + "," + std::to_string(ids[i].term);
+        if (i < ids.size() - 1) {
+            s += ";";
+        }
+    }
+    return s;
+}
+
+
+#endif // COMMON_HPP
+
+=== END OF common.hpp ===
+
+
+=== FILE: follower.cpp ===
+
+// === FILE: follower.cpp ===
+#include "follower.hpp"
+#include <vector>
+#include <chrono>
+
+Follower::Follower(int r) : rank(r), currentTerm(1), logStartIndex_0based(0), commitIndex(-1),
+                            clientResponseBatchTimer(), append_count(0), noProgressCounter(0) {}
+
+Follower::~Follower() {
+    for (auto& send : outstandingSends) {
+        delete[] send.buffer;
+    }
+}
+
+void Follower::run(bool& shutdown_flag) {
+    log_debug("FOLLOWER" + std::to_string(rank), "Started with rank " + std::to_string(rank));
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;
+    
+    // *** ENHANCED FOLLOWER FLOW CONTROL ***
+    const int AGGRESSIVE_CLEANUP_THRESHOLD = 50;
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int cleanupCounter = 0;
+    int stuckDetectionCounter = 0;  // To reduce spam
+
+    while (!shutdown_flag) {
+        // *** MORE AGGRESSIVE SEND COMPLETION CHECKING FOR LATENCY ***
+        checkCompletedSends();
+
+        MPI_Status status;
+        int flag = 0;
+        bool progress_made = false;
+
+        // *** IMPROVED BACKPRESSURE FOR FOLLOWERS ***
+        bool canAcceptWork = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.8));
+
+        if (canAcceptWork) {
+            MPI_Iprobe(SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &flag, &status);
+            if (flag) {
+                handleSwitchReplicate(status);
+                progress_made = true;
+                checkCompletedSends();  // Immediate cleanup after switch replication
+            }
+        }
+
+        // Always handle NetAgg messages - critical for progress
+        MPI_Iprobe(NETAGG_RANK, APPEND_ENTRIES_REQUEST, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            handleAppendEntries(status);
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after append entries
+        }
+
+        MPI_Iprobe(NETAGG_RANK, AGG_COMMIT, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            handleAggCommit(status);
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after commit
+        }
+        
+        // *** PRIORITIZE CLIENT RESPONSES TO PREVENT STUCK REQUESTS ***
+        if (sendBatchedClientResponses()) {
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after sending responses
+        }
+        
+        // *** ADDITIONAL CLEANUP CYCLES ***
+        cleanupCounter++;
+        if (cleanupCounter % 50 == 0) {  // More frequent for followers
+            checkCompletedSends();
+        }
+        
+        if (outstandingSends.size() > AGGRESSIVE_CLEANUP_THRESHOLD) {
+            checkCompletedSends();
+        }
+
+        if (progress_made) {
+            noProgressCounter = 0;
+        } else {
+            noProgressCounter++;
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                // *** ENHANCED STALL LOGGING FOR FOLLOWERS ***
+                std::cout << "[FOLLOWER" << rank << "_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                         << ", Request buffer: " << requestBuffer.size()
+                         << ", Client responses: " << clientResponseBuffer.size()
+                         << ", Log size: " << log.size()
+                         << ", Commit index: " << commitIndex << std::endl;
+            }
+        }
+        
+        // *** PERIODIC HEALTH REPORTING ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
+        if (timeSinceStats.count() >= 30) {
+            std::cout << "[FOLLOWER" << rank << "_STATUS] Outstanding: " << outstandingSends.size() 
+                     << "/" << MAX_OUTSTANDING_SENDS << ", Request buffer: " << requestBuffer.size()
+                     << ", Client responses: " << clientResponseBuffer.size() 
+                     << ", Log size: " << log.size() << ", Commit: " << commitIndex
+                     << ", Append count: " << append_count << std::endl;
+            lastStatsTime = currentTime;
+        }
+        
+        // *** EMERGENCY CLEANUP FOR BUFFER OVERFLOW ***
+        if (requestBuffer.size() > 1000) {
+            std::cout << "[FOLLOWER" << rank << "_WARNING] Request buffer overflow: " 
+                     << requestBuffer.size() << ", forcing cleanup" << std::endl;
+            
+            for (int i = 0; i < 5; i++) {
+                checkCompletedSends();
+            }
+            
+            // Emergency: drop oldest requests if critically full
+            if (requestBuffer.size() > 1500) {
+                std::cout << "[FOLLOWER" << rank << "_EMERGENCY] Dropping oldest requests" << std::endl;
+                auto it = requestBuffer.begin();
+                int dropped = 0;
+                while (it != requestBuffer.end() && dropped < 200) {
+                    auto toErase = it++;
+                    requestBuffer.erase(toErase);
+                    dropped++;
+                }
+                std::cout << "[FOLLOWER" << rank << "_EMERGENCY] Dropped " << dropped << " requests" << std::endl;
+            }
+        }
+        
+        // *** DETECT AND RECOVER FROM STUCK REQUEST BUFFERS ***
+        if (requestBuffer.size() > 15) {  // Lowered from 20 - catch the 19-request case
+            stuckDetectionCounter++;
+            
+            // Only log every 100 iterations to reduce spam
+            if (stuckDetectionCounter % 100 == 1) {  // Log on first detection and every 100th after
+                std::cout << "[FOLLOWER" << rank << "_STUCK_DETECTION] " << requestBuffer.size() 
+                         << " requests stuck in buffer, attempting recovery (check #" 
+                         << stuckDetectionCounter << ")" << std::endl;
+            }
+            
+            // *** LOWER THRESHOLD FOR SMALL PERSISTENT DEADLOCKS ***
+            if (requestBuffer.size() > 18) {  // Lowered from 25 to 18 - handle the 19-request case
+                std::cout << "[FOLLOWER" << rank << "_EMERGENCY_PROCESS] Force processing stuck requests" << std::endl;
+                
+                int processed = 0;
+                auto it = requestBuffer.begin();
+                while (it != requestBuffer.end() && processed < 50) {  // Process up to 50 at a time
+                    const auto& [value, entry] = *it;
+                    
+                    // Create log entry with current term (emergency processing)
+                    LogEntry emergency_entry = entry;
+                    emergency_entry.term = currentTerm;
+                    
+                    // Add directly to log
+                    log.push_back(emergency_entry);
+                    if (log.size() > LOG_MAX_SIZE) {
+                        log.pop_front();
+                        logStartIndex_0based++;
+                    }
+                    
+                    // If this request should respond to this follower, add to response buffer
+                    if (emergency_entry.clientRank == rank) {
+                        clientResponseBuffer.push_back(emergency_entry);
+                        std::cout << "[FOLLOWER" << rank << "_EMERGENCY_RESPONSE] Added response for request " 
+                                 << emergency_entry.value << std::endl;
+                    }
+                    
+                    // Remove from request buffer
+                    unorderedRequestValues.erase(value);
+                    it = requestBuffer.erase(it);
+                    processed++;
+                }
+                
+                std::cout << "[FOLLOWER" << rank << "_EMERGENCY_PROCESS] Processed " << processed 
+                         << " stuck requests, remaining: " << requestBuffer.size() << std::endl;
+                
+                // Update commit index to reflect processed entries
+                int new_last_log_idx = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+                commitIndex = new_last_log_idx;
+                
+                progress_made = true;  // Mark progress to reset stall counter
+                stuckDetectionCounter = 0;  // Reset counter after successful processing
+            }
+            
+            // *** TIME-BASED EMERGENCY RECOVERY FOR ULTRA-LOW LATENCY ***
+            else if (requestBuffer.size() > 15 && noProgressCounter > 3000000) {  // Reduced from 5M to 3M - faster for small counts
+                std::cout << "[FOLLOWER" << rank << "_TIME_EMERGENCY] Processing " 
+                         << requestBuffer.size() << " requests due to latency-critical stall" << std::endl;
+                
+                int processed = 0;
+                auto it = requestBuffer.begin();
+                while (it != requestBuffer.end() && processed < requestBuffer.size()) {  // Process ALL stuck requests
+                    const auto& [value, entry] = *it;
+                    
+                    LogEntry emergency_entry = entry;
+                    emergency_entry.term = currentTerm;
+                    
+                    log.push_back(emergency_entry);
+                    if (log.size() > LOG_MAX_SIZE) {
+                        log.pop_front();
+                        logStartIndex_0based++;
+                    }
+                    
+                    if (emergency_entry.clientRank == rank) {
+                        clientResponseBuffer.push_back(emergency_entry);
+                    }
+                    
+                    unorderedRequestValues.erase(value);
+                    it = requestBuffer.erase(it);
+                    processed++;
+                }
+                
+                std::cout << "[FOLLOWER" << rank << "_TIME_EMERGENCY] Processed ALL " << processed 
+                         << " stuck requests for latency recovery" << std::endl;
+                
+                int new_last_log_idx = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+                commitIndex = new_last_log_idx;
+                progress_made = true;
+                stuckDetectionCounter = 0;
+            }
+            
+            // *** ALTERNATIVE RECOVERY: Force processing even below 25 if stuck too long ***
+            else if (requestBuffer.size() > 10 && noProgressCounter > 6000000) {  // Reduced from 10M to 6M - more aggressive timeout
+                std::cout << "[FOLLOWER" << rank << "_TIMEOUT_RECOVERY] Processing " 
+                         << requestBuffer.size() << " requests due to prolonged stall" << std::endl;
+
+                int processed = 0;
+                auto it = requestBuffer.begin();
+                while (it != requestBuffer.end() && processed < 25) {  // Process fewer at a time
+                    const auto& [value, entry] = *it;
+                    
+                    LogEntry emergency_entry = entry;
+                    emergency_entry.term = currentTerm;
+                    
+                    log.push_back(emergency_entry);
+                    if (log.size() > LOG_MAX_SIZE) {
+                        log.pop_front();
+                        logStartIndex_0based++;
+                    }
+                    
+                    if (emergency_entry.clientRank == rank) {
+                        clientResponseBuffer.push_back(emergency_entry);
+                    }
+                    
+                    unorderedRequestValues.erase(value);
+                    it = requestBuffer.erase(it);
+                    processed++;
+                }
+                
+                std::cout << "[FOLLOWER" << rank << "_TIMEOUT_RECOVERY] Processed " << processed 
+                         << " requests, remaining: " << requestBuffer.size() << std::endl;
+                
+                int new_last_log_idx = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+                commitIndex = new_last_log_idx;
+                progress_made = true;
+                stuckDetectionCounter = 0;
+            }
+        } else {
+            stuckDetectionCounter = 0;  // Reset when no longer stuck
+        }
+        
+        // *** FORCE CLIENT RESPONSE SENDING WHEN BACKLOGGED ***
+        if (clientResponseBuffer.size() > 50) {
+            std::cout << "[FOLLOWER" << rank << "_RESPONSE_FORCE] Forcing " 
+                     << clientResponseBuffer.size() << " client responses" << std::endl;
+            sendBatchedClientResponses();  // Force send even if timeout not reached
+        }
+    }
+}
+
+void Follower::pruneRequestBuffer() {
+    return;
+}
+
+void Follower::sendAppendEntriesResponse(bool success, int matchIdx_1based) {
+    std::string data_str = std::to_string(currentTerm) + "|" +
+                          (success ? "1" : "0") + "|" +
+                          std::to_string(matchIdx_1based) + "|" +
+                          std::to_string(rank);
+
+    int msg_len = data_str.length() + 1;
+    char* send_buffer = new char[msg_len];
+    strncpy(send_buffer, data_str.c_str(), msg_len);
+
+    MPI_Request mpi_req;
+    MPI_Isend(send_buffer, msg_len, MPI_CHAR, NETAGG_RANK,
+              APPEND_ENTRIES_RESPONSE, MPI_COMM_WORLD, &mpi_req);
+
+    outstandingSends.push_back({mpi_req, send_buffer});
+}
+
+bool Follower::sendBatchedClientResponses() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
+    }
+
+    if (clientResponseBuffer.empty()) {
+        return false;
+    }
+    
+    // *** ENHANCED BATCHING LOGIC FOR ULTRA-LOW LATENCY ***
+    if (clientResponseBatchTimer == std::chrono::high_resolution_clock::time_point{}) {
+        clientResponseBatchTimer = std::chrono::high_resolution_clock::now();
+    }
+
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - clientResponseBatchTimer);
+
+    bool batchIsFull = clientResponseBuffer.size() >= BATCH_SIZE;
+    bool timeoutReached = elapsed.count() >= BATCH_TIMEOUT_MS;
+
+    // *** ULTRA-AGGRESSIVE RESPONSE SENDING FOR LATENCY ***
+    bool forceImmediate = clientResponseBuffer.size() >= 5;   // Reduced from 10
+    bool ultraFast = clientResponseBuffer.size() >= 1 && elapsed.count() >= 1;  // 1ms timeout for any response
+    bool shortTimeout = clientResponseBuffer.size() > 2 && elapsed.count() >= (BATCH_TIMEOUT_MS / 3);  // Even shorter
+
+    if (!batchIsFull && !timeoutReached && !forceImmediate && !shortTimeout && !ultraFast) {
+        return false;
+    }
+
+    size_t count_to_send = clientResponseBuffer.size();
+    std::string response_str = "SUCCESS";
+    for (size_t i = 0; i < count_to_send; ++i) {
+        const auto& entry = clientResponseBuffer[i];
+        response_str += "|" + std::to_string(entry.value) + "|" + entry.payload;
+    }
+
+    int msg_len = response_str.length() + 1;
+    char* send_buffer = new char[msg_len];
+    strncpy(send_buffer, response_str.c_str(), msg_len);
+
+    MPI_Request mpi_req;
+    MPI_Isend(send_buffer, msg_len, MPI_CHAR, CLIENT_RANK,
+              CLIENT_RESPONSE, MPI_COMM_WORLD, &mpi_req);
+
+    outstandingSends.push_back({mpi_req, send_buffer});
+
+    // *** ENHANCED LOGGING FOR RESPONSE SENDING (REDUCED FOR LATENCY) ***
+    if (count_to_send > 3 || forceImmediate || ultraFast) {  // Only log for larger batches
+        std::cout << "[FOLLOWER" << rank << "_RESPONSE_SEND] Sent " << count_to_send 
+                 << " responses" << (forceImmediate ? " (FORCED)" : "") 
+                 << (shortTimeout ? " (SHORT_TIMEOUT)" : "")
+                 << (ultraFast ? " (ULTRA_FAST)" : "") << std::endl;
+    }
+
+    clientResponseBuffer.erase(clientResponseBuffer.begin(), clientResponseBuffer.begin() + count_to_send);
+    clientResponseBatchTimer = std::chrono::high_resolution_clock::time_point{};
+    return true;
+}
+
+void Follower::checkCompletedSends() {
+    if (outstandingSends.empty()) return;
+
+    auto it = outstandingSends.begin();
+    while (it != outstandingSends.end()) {
+        int flag = 0;
+        MPI_Test(&it->request, &flag, MPI_STATUS_IGNORE);
+        if (flag) {
+            delete[] it->buffer;
+            it = outstandingSends.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Follower::handleSwitchReplicate(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer(msg_size);
+
+    MPI_Request request;
+    MPI_Irecv(buffer.data(), msg_size, MPI_CHAR, SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer.data(), msg_size - 1);
+
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 4) return;
+
+    RequestID rid;
+    rid.value = std::stoi(parts[0]);
+    rid.term = std::stoi(parts[1]);
+    std::string payload_str = parts[2];
+    int client_rank_val = std::stoi(parts[3]);
+
+    if (requestBuffer.find(rid.value) == requestBuffer.end()) {
+        requestBuffer[rid.value] = LogEntry(rid.term, rid.value, payload_str, client_rank_val);
+        unorderedRequestValues.insert(rid.value);
+    }
+}
+
+void Follower::handleAppendEntries(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer_vec(msg_size);
+
+    MPI_Request request;
+    MPI_Irecv(buffer_vec.data(), msg_size, MPI_CHAR, NETAGG_RANK, APPEND_ENTRIES_REQUEST, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer_vec.data(), msg_size - 1);
+
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 8) return;
+    
+    AppendEntriesMsg msg;
+    msg.term = std::stoi(parts[0]);
+    msg.prevLogIndex = std::stoi(parts[1]);
+    msg.prevLogTerm = std::stoi(parts[2]);
+    msg.firstEntryIndex = std::stoi(parts[3]);
+    std::vector<RequestID> batch_rids = deserialize_batched_ids(parts[4]);
+    msg.commitIndex = std::stoi(parts[5]);
+
+    int last_log_idx_0based = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+
+    if (msg.term < currentTerm) {
+        sendAppendEntriesResponse(false, last_log_idx_0based + 1);
+        return;
+    }
+    currentTerm = msg.term;
+
+    int prevLogIndex_0based = msg.prevLogIndex - 1;
+    bool prev_log_ok = (msg.prevLogIndex == 0);
+    if (!prev_log_ok && prevLogIndex_0based >= logStartIndex_0based && prevLogIndex_0based <= last_log_idx_0based) {
+        int deque_idx = prevLogIndex_0based - logStartIndex_0based;
+        if (log[deque_idx].term == msg.prevLogTerm) {
+            prev_log_ok = true;
+        }
+    }
+
+    if (!prev_log_ok) {
+        sendAppendEntriesResponse(false, last_log_idx_0based + 1);
+        return;
+    }
+
+    size_t leader_batch_idx = 0;
+    for (; leader_batch_idx < batch_rids.size(); ++leader_batch_idx) {
+        int entry_idx_0based = msg.firstEntryIndex - 1 + leader_batch_idx;
+        if (entry_idx_0based > last_log_idx_0based || entry_idx_0based < logStartIndex_0based) {
+            break;
+        }
+        int deque_idx = entry_idx_0based - logStartIndex_0based;
+        if (log[deque_idx].term != batch_rids[leader_batch_idx].term) {
+            log.erase(log.begin() + deque_idx, log.end());
+            break;
+        }
+    }
+
+    int appended_this_call = 0;
+    for (size_t i = leader_batch_idx; i < batch_rids.size(); ++i) {
+        const auto& rid = batch_rids[i];
+        auto it = requestBuffer.find(rid.value);
+        if (it == requestBuffer.end()) {
+            break;
+        }
+
+        LogEntry new_entry = it->second;
+        new_entry.term = rid.term;
+
+        log.push_back(new_entry);
+        if (log.size() > LOG_MAX_SIZE) {
+            log.pop_front();
+            logStartIndex_0based++;
+        }
+        requestBuffer.erase(it);
+        unorderedRequestValues.erase(rid.value);
+        appended_this_call++;
+    }
+
+    if (appended_this_call > 0) {
+        long long old_append_count = append_count;
+        append_count += appended_this_call;
+        const int PRUNE_INTERVAL = 5000;
+        if ((append_count / PRUNE_INTERVAL) > (old_append_count / PRUNE_INTERVAL)) {
+            pruneRequestBuffer();
+        }
+    }
+
+    int new_last_log_idx = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+    sendAppendEntriesResponse(true, new_last_log_idx + 1);
+
+    if (msg.commitIndex > commitIndex) {
+        int old_ci = commitIndex;
+        commitIndex = std::min(msg.commitIndex, new_last_log_idx);
+        for (int i = old_ci + 1; i <= commitIndex; ++i) {
+            if (i >= logStartIndex_0based) {
+                int deque_idx = i - logStartIndex_0based;
+                if (log[deque_idx].clientRank == rank) {
+                    clientResponseBuffer.push_back(log[deque_idx]);
+                }
+            }
+        }
+    }
+}
+
+void Follower::handleAggCommit(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer(msg_size);
+
+    MPI_Request request;
+    MPI_Irecv(buffer.data(), msg_size, MPI_CHAR, NETAGG_RANK, AGG_COMMIT, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer.data(), msg_size - 1);
+
+    std::vector<std::string> commits = split_string(data, ';');
+    if (commits.empty()) return;
+
+    int maxCommitIndexInBatch_0based = -1;
+    for (const auto& commit_str : commits) {
+        if (commit_str.empty()) continue;
+        std::vector<std::string> parts = split_string(commit_str, ',');
+        if (parts.size() < 2) continue;
+
+        int newCommitIndex_0based = std::stoi(parts[0]) - 1;
+        if (newCommitIndex_0based > maxCommitIndexInBatch_0based) {
+            maxCommitIndexInBatch_0based = newCommitIndex_0based;
+        }
+    }
+    
+    if (maxCommitIndexInBatch_0based > commitIndex) {
+        int old_commit_idx = commitIndex;
+        int last_log_idx_0based = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+        commitIndex = std::min(maxCommitIndexInBatch_0based, last_log_idx_0based);
+
+        for (int i = old_commit_idx + 1; i <= commitIndex; ++i) {
+             if (i >= logStartIndex_0based) {
+                int deque_idx = i - logStartIndex_0based;
+                if (log[deque_idx].clientRank == rank) {
+                    clientResponseBuffer.push_back(log[deque_idx]);
+                }
+            }
+        }
+    }
+}
+=== END OF follower.cpp ===
+
+
+=== FILE: follower.hpp ===
+
+#ifndef FOLLOWER_HPP
+#define FOLLOWER_HPP
+
+#include "common.hpp"
+#include <thread>
+#include <list> // For managing outstanding sends
+#include <deque>
+#include <chrono> // For batching timer
+
+class Follower {
+private:
+    int rank;
+    int currentTerm;
+    std::deque<LogEntry> log;
+    int logStartIndex_0based; // Absolute index of log.front()
+    std::vector<LogEntry> clientResponseBuffer;
+
+    // --- BATCHING TIMER ---
+    std::chrono::high_resolution_clock::time_point clientResponseBatchTimer;
+
+    int commitIndex;
+
+    std::map<int, LogEntry> requestBuffer;
+    std::set<int> unorderedRequestValues;
+    
+    // Structure for non-blocking sends
+    struct OutstandingSend {
+        MPI_Request request;
+        char* buffer;
+    };
+    std::list<OutstandingSend> outstandingSends;
+
+    // --- FIX: Members for periodic cleanup ---
+    long long append_count; // Counter to trigger periodic cleanup
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
+    void handleSwitchReplicate(MPI_Status& status);
+    void handleAppendEntries(MPI_Status& status);
+    void sendAppendEntriesResponse(bool success, int matchIdx_1based);
+    void handleAggCommit(MPI_Status& status);
+    bool sendBatchedClientResponses();
+    void checkCompletedSends();
+    void pruneRequestBuffer(); // New cleanup function
+
+public:
+    Follower(int r);
+    ~Follower(); // Destructor
+    void run(bool& shutdown_flag);
+};
+
+#endif // FOLLOWER_HPP
+
+=== END OF follower.hpp ===
+
+
+=== FILE: leader.cpp ===
+
+// === FILE: leader.cpp ===
+#include "leader.hpp"
+#include <vector>
+#include <chrono>
+
+Leader::Leader() : rank(LEADER_RANK), currentTerm(1), logStartIndex_0based(0), commitIndex(-1), lastSentLogIndexToNetAgg(-1),
+                   clientResponseBatchTimer(), noProgressCounter(0) {
+    nextIndex[FOLLOWER1_RANK] = 1;
+    nextIndex[FOLLOWER2_RANK] = 1;
+    matchIndex[FOLLOWER1_RANK] = -1;
+    matchIndex[FOLLOWER2_RANK] = -1;
+}
+
+Leader::~Leader() {
+    for (auto& send : outstandingSends) {
+        delete[] send.buffer;
+    }
+}
+
+void Leader::run(bool& shutdown_flag) {
+    log_debug("LEADER", "Started with rank " + std::to_string(rank) +
+              ", term " + std::to_string(currentTerm));
+    
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;
+    
+    // *** ENHANCED LEADER FLOW CONTROL ***
+    const int AGGRESSIVE_CLEANUP_THRESHOLD = 50;
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int cleanupCounter = 0;
+
+    while (!shutdown_flag) {
+        // *** MORE AGGRESSIVE SEND COMPLETION CHECKING FOR LATENCY ***
+        checkCompletedSends();
+
+        MPI_Status status;
+        int flag = 0;
+        bool progress_made = false;
+
+        // *** IMPROVED BACKPRESSURE MANAGEMENT ***
+        bool canAcceptFromSwitch = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.8));  // More conservative
+        bool canSendToNetAgg = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.9));       // Increased from default - more parallel
+        
+        if (canAcceptFromSwitch) {
+            MPI_Iprobe(SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &flag, &status);
+            if (flag) {
+                handleSwitchReplicate(status);
+                progress_made = true;
+                checkCompletedSends();  // Immediate cleanup after receiving
+            }
+        }
+
+        // Always probe for commits from NetAgg, as they help clear the pipeline
+        MPI_Iprobe(NETAGG_RANK, AGG_COMMIT, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            handleAggCommit(status);
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after commit
+        }
+
+        if (processUnorderedRequests()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after processing
+        }
+        if (sendToNetAgg()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after sending
+        }
+        if (sendBatchedClientResponses()) {
+            progress_made = true;
+            checkCompletedSends();  // Cleanup after responses
+        }
+        
+        // *** ADDITIONAL CLEANUP CYCLES ***
+        cleanupCounter++;
+        if (cleanupCounter % 100 == 0) {
+            checkCompletedSends();
+        }
+        
+        if (outstandingSends.size() > AGGRESSIVE_CLEANUP_THRESHOLD) {
+            checkCompletedSends();
+        }
+        
+        if (progress_made) {
+            noProgressCounter = 0;
+        } else {
+            noProgressCounter++;
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                // *** ENHANCED STALL LOGGING ***
+                std::cout << "[LEADER_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                         << ", Unordered: " << unorderedRequests.size() 
+                         << ", Client responses: " << clientResponseBuffer.size()
+                         << ", Can accept: " << (canAcceptFromSwitch ? "YES" : "NO") << std::endl;
+            }
+        }
+        
+        // *** PERIODIC HEALTH REPORTING ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
+        if (timeSinceStats.count() >= 30) {
+            std::cout << "[LEADER_STATUS] Log size: " << log.size() 
+                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                     << ", Unordered: " << unorderedRequests.size()
+                     << ", Commit index: " << commitIndex 
+                     << ", Progress checks: " << noProgressCounter << std::endl;
+            lastStatsTime = currentTime;
+        }
+        
+        // *** EMERGENCY CLEANUP FOR REQUEST BUFFER OVERFLOW ***
+        if (requestBuffer.size() > 500) {  // Emergency threshold
+            std::cout << "[LEADER_WARNING] Request buffer overflow: " << requestBuffer.size() 
+                     << ", forcing cleanup and processing" << std::endl;
+            
+            // Force multiple cleanup cycles
+            for (int i = 0; i < 5; i++) {
+                checkCompletedSends();
+            }
+            
+            // Force process some unordered requests even if it might create more sends
+            if (unorderedRequests.size() > 100) {
+                processUnorderedRequests();  // Force processing
+            }
+        }
+    }
+}
+
+bool Leader::sendToNetAgg() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
+    }
+
+    int nextLogIndexToSend_0based = lastSentLogIndexToNetAgg + 1;
+    int lastLogIndex_0based = logStartIndex_0based + log.size() - 1;
+
+    if (nextLogIndexToSend_0based <= lastLogIndex_0based) {
+        std::vector<RequestID> batch_ids;
+        for (int i = 0; i < BATCH_SIZE && (nextLogIndexToSend_0based + i) <= lastLogIndex_0based; ++i) {
+            int current_absolute_idx = nextLogIndexToSend_0based + i;
+            int deque_idx = current_absolute_idx - logStartIndex_0based;
+            const LogEntry& entry = log[deque_idx];
+            batch_ids.push_back({entry.value, entry.term});
+            // std::cout << "[LEADER] SEND_TO_NETAGG value=" << entry.value << std::endl;
+        }
+
+        if (batch_ids.empty()) return false;
+
+        AppendEntriesNetAggMsg msg;
+        msg.term = currentTerm;
+        msg.prevLogIndex = nextLogIndexToSend_0based; 
+        msg.prevLogTerm = 0;
+        if (msg.prevLogIndex > 0) {
+            int prev_deque_idx = (msg.prevLogIndex - 1) - logStartIndex_0based;
+            if (prev_deque_idx >= 0 && prev_deque_idx < static_cast<int>(log.size())) {
+                msg.prevLogTerm = log[prev_deque_idx].term;
+            }
+        }
+
+        msg.firstEntryIndex = nextLogIndexToSend_0based + 1;
+        msg.batchedEntryIds = serialize_batched_ids(batch_ids);
+        msg.commitIndex = commitIndex;
+        msg.source = rank;
+
+        std::string data_str = std::to_string(msg.term) + "|" +
+                              std::to_string(msg.prevLogIndex) + "|" +
+                              std::to_string(msg.prevLogTerm) + "|" +
+                              std::to_string(msg.firstEntryIndex) + "|" +
+                              msg.batchedEntryIds + "|" +
+                              std::to_string(msg.commitIndex) + "|" +
+                              std::to_string(msg.source);
+
+        int msg_len = data_str.length() + 1;
+        char* send_buffer = new char[msg_len];
+        strncpy(send_buffer, data_str.c_str(), msg_len);
+
+        MPI_Request mpi_req;
+        MPI_Isend(send_buffer, msg_len, MPI_CHAR, NETAGG_RANK,
+                  APPEND_ENTRIES_NETAGG_REQUEST, MPI_COMM_WORLD, &mpi_req);
+
+        outstandingSends.push_back({mpi_req, send_buffer});
+
+        lastSentLogIndexToNetAgg += batch_ids.size();
+        return true;
+    }
+    return false;
+}
+
+bool Leader::sendBatchedClientResponses() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
+    }
+
+    if (clientResponseBuffer.empty()) {
+        return false;
+    }
+
+    // *** ENHANCED BATCHING LOGIC FOR ULTRA-LOW LATENCY ***
+    if (clientResponseBatchTimer == std::chrono::high_resolution_clock::time_point{}) {
+        clientResponseBatchTimer = std::chrono::high_resolution_clock::now();
+    }
+
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - clientResponseBatchTimer);
+
+    bool batchIsFull = clientResponseBuffer.size() >= BATCH_SIZE;
+    bool timeoutReached = elapsed.count() >= BATCH_TIMEOUT_MS;
+
+    // *** ULTRA-AGGRESSIVE RESPONSE SENDING FOR LATENCY ***
+    bool forceImmediate = clientResponseBuffer.size() >= 5;   // Reduced from 10
+    bool ultraFast = clientResponseBuffer.size() >= 1 && elapsed.count() >= 1;  // 1ms timeout for any response
+    bool shortTimeout = clientResponseBuffer.size() > 2 && elapsed.count() >= (BATCH_TIMEOUT_MS / 3);  // Even shorter
+
+    if (!batchIsFull && !timeoutReached && !forceImmediate && !shortTimeout && !ultraFast) {
+        return false;
+    }
+
+    size_t count_to_send = clientResponseBuffer.size();
+
+    std::string response_str = "SUCCESS";
+    for (size_t i = 0; i < count_to_send; ++i) {
+        const auto& entry = clientResponseBuffer[i];
+        response_str += "|" + std::to_string(entry.value) + "|" + entry.payload;
+    }
+
+    int msg_len = response_str.length() + 1;
+    char* send_buffer = new char[msg_len];
+    strncpy(send_buffer, response_str.c_str(), msg_len);
+
+    MPI_Request mpi_req;
+    MPI_Isend(send_buffer, msg_len, MPI_CHAR, CLIENT_RANK,
+              CLIENT_RESPONSE, MPI_COMM_WORLD, &mpi_req);
+
+    outstandingSends.push_back({mpi_req, send_buffer});
+
+    // *** ENHANCED LOGGING FOR RESPONSE SENDING (REDUCED FOR LATENCY) ***
+    if (count_to_send > 3 || forceImmediate || ultraFast) {  // Only log for larger batches
+        std::cout << "[LEADER_RESPONSE_SEND] Sent " << count_to_send 
+                 << " responses" << (forceImmediate ? " (FORCED)" : "") 
+                 << (shortTimeout ? " (SHORT_TIMEOUT)" : "")
+                 << (ultraFast ? " (ULTRA_FAST)" : "") << std::endl;
+    }
+
+    clientResponseBuffer.erase(clientResponseBuffer.begin(), clientResponseBuffer.begin() + count_to_send);
+    clientResponseBatchTimer = std::chrono::high_resolution_clock::time_point{};
+    return true;
+}
+
+void Leader::checkCompletedSends() {
+    if (outstandingSends.empty()) return;
+
+    auto it = outstandingSends.begin();
+    while (it != outstandingSends.end()) {
+        int flag = 0;
+        MPI_Test(&it->request, &flag, MPI_STATUS_IGNORE);
+        if (flag) {
+            delete[] it->buffer;
+            it = outstandingSends.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Leader::handleSwitchReplicate(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer(msg_size);
+
+    MPI_Request request;
+    MPI_Irecv(buffer.data(), msg_size, MPI_CHAR, SWITCH_RANK, SWITCH_REPLICATE, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer.data(), msg_size - 1);
+    
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 4) { return; }
+    
+    RequestID rid;
+    rid.value = std::stoi(parts[0]);
+    rid.term = std::stoi(parts[1]);
+    std::string payload = parts[2];
+    int clientRank = std::stoi(parts[3]);
+
+    // std::cout << "[LEADER] RECV_REPL value=" << rid.value << std::endl;
+
+    if (requestBuffer.find(rid) == requestBuffer.end()) {
+        requestBuffer[rid] = LogEntry(rid.term, rid.value, payload, clientRank);
+        unorderedRequests.insert(rid);
+    }
+}
+
+bool Leader::processUnorderedRequests() {
+    if (unorderedRequests.empty()) {
+        return false;
+    }
+    
+    auto it = unorderedRequests.begin();
+    while (it != unorderedRequests.end()) {
+        const RequestID& rid_from_switch = *it;
+        auto buffer_it = requestBuffer.find(rid_from_switch);
+        if (buffer_it != requestBuffer.end()) {
+            LogEntry entry_data = buffer_it->second;
+            entry_data.term = currentTerm;
+
+            log.push_back(entry_data);
+            if (log.size() > LOG_MAX_SIZE) {
+                log.pop_front();
+                logStartIndex_0based++;
+            }
+
+            requestBuffer.erase(buffer_it);
+            it = unorderedRequests.erase(it);
+        } else {
+            it = unorderedRequests.erase(it);
+        }
+    }
+    return true;
+}
+
+void Leader::handleAggCommit(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer(msg_size);
+
+    MPI_Request request;
+    MPI_Irecv(buffer.data(), msg_size, MPI_CHAR, NETAGG_RANK, AGG_COMMIT, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer.data(), msg_size - 1);
+
+    std::vector<std::string> commits = split_string(data, ';');
+    if (commits.empty()) return;
+
+    int maxCommitIndexInBatch_0based = -1;
+    for (const auto& commit_str : commits) {
+        if (commit_str.empty()) continue;
+        std::vector<std::string> parts = split_string(commit_str, ',');
+        if (parts.size() < 2) continue;
+
+        int newCommitIndex_0based = std::stoi(parts[0]) - 1;
+        if (newCommitIndex_0based > maxCommitIndexInBatch_0based) {
+            maxCommitIndexInBatch_0based = newCommitIndex_0based;
+        }
+    }
+
+    if (maxCommitIndexInBatch_0based > commitIndex) {
+        int old_commit_idx = commitIndex;
+        int last_log_idx_0based = log.empty() ? -1 : logStartIndex_0based + log.size() - 1;
+        commitIndex = std::min(maxCommitIndexInBatch_0based, last_log_idx_0based);
+
+        for (int i = old_commit_idx + 1; i <= commitIndex; ++i) {
+            if (i >= logStartIndex_0based) {
+                int deque_idx = i - logStartIndex_0based;
+                if (log[deque_idx].clientRank == rank) {
+                    clientResponseBuffer.push_back(log[deque_idx]);
+                }
+            }
+        }
+    }
+}
+=== END OF leader.cpp ===
+
+
+=== FILE: leader.hpp ===
+
+#ifndef LEADER_HPP
+#define LEADER_HPP
+
+#include "common.hpp"
+#include <thread>
+#include <algorithm>
+#include <list> // For managing outstanding sends
+#include <deque>
+#include <chrono> // For batching timer
+
+class Leader {
+private:
+    int rank;
+    int currentTerm;
+    std::deque<LogEntry> log;
+    int logStartIndex_0based; // Absolute index of log.front()
+    std::vector<LogEntry> clientResponseBuffer;
+
+    // --- BATCHING TIMER ---
+    std::chrono::high_resolution_clock::time_point clientResponseBatchTimer;
+
+    int commitIndex;
+    std::map<int, int> nextIndex;
+    std::map<int, int> matchIndex;
+
+    std::set<RequestID> unorderedRequests;
+    std::map<RequestID, LogEntry> requestBuffer;
+
+    int lastSentLogIndexToNetAgg;
+
+    // Structure for non-blocking sends
+    struct OutstandingSend {
+        MPI_Request request;
+        char* buffer; // Buffer must remain valid until send completes
+    };
+    std::list<OutstandingSend> outstandingSends;
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
+    void handleSwitchReplicate(MPI_Status& status);
+    bool processUnorderedRequests();
+    bool sendToNetAgg();
+    void handleAggCommit(MPI_Status& status);
+    bool sendBatchedClientResponses();
+    void checkCompletedSends();
+
+public:
+    Leader();
+    ~Leader(); // Destructor to clean up resources
+    void run(bool& shutdown_flag);
+};
+
+#endif // LEADER_HPP
+
+=== END OF leader.hpp ===
+
+
+=== FILE: main.cpp ===
+
+// Main driver for HoverCraft++ consensus protocol implementation
+
+#include "common.hpp"
+#include "switch.hpp"
+#include "leader.hpp"
+#include "follower.hpp"
+#include "netagg.hpp"
+#include "client.hpp"
+
+// Include implementations
+#include "switch.cpp"
+#include "leader.cpp"
+#include "follower.cpp"
+#include "netagg.cpp"
+#include "client.cpp"
+
+bool shutdown_flag = false;
+
+int main(int argc, char** argv) {
+    // MPI_Init(&argc, &argv);
+    
+    // int rank, size;
+    // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    // MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int provided_thread_level;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided_thread_level);
+    
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Check if the MPI library provides the required level of thread support
+    if (provided_thread_level < MPI_THREAD_MULTIPLE) {
+        if (rank == 0) {
+            fprintf(stderr, "ERROR: Your MPI implementation does not support MPI_THREAD_MULTIPLE.\n");
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    
+    if (size != 6) {
+        if (rank == 0) {
+            std::cerr << "Error: This program requires exactly 6 MPI processes:" << std::endl;
+            std::cerr << "  Rank 0: Switch" << std::endl;
+            std::cerr << "  Rank 1: Leader" << std::endl;
+            std::cerr << "  Rank 2: Follower1" << std::endl;
+            std::cerr << "  Rank 3: Follower2" << std::endl;
+            std::cerr << "  Rank 4: NetAgg" << std::endl;
+            std::cerr << "  Rank 5: Client" << std::endl;
+            std::cerr << "Run with: mpirun -np 6 ./hovercraft_demo [num_requests]" << std::endl;
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    
+    // Each rank runs its designated component
+    switch (rank) {
+        case SWITCH_RANK: {
+            Switch switchComponent;
+            switchComponent.run(shutdown_flag);
+            break;
+        }
+        case LEADER_RANK: {
+            Leader leader;
+            leader.run(shutdown_flag);
+            break;
+        }
+        case FOLLOWER1_RANK:
+        case FOLLOWER2_RANK: {
+            Follower follower(rank);
+            follower.run(shutdown_flag);
+            break;
+        }
+        case NETAGG_RANK: {
+            NetAgg netagg;
+            netagg.run(shutdown_flag);
+            break;
+        }
+        case CLIENT_RANK: {
+            int numRequests = 10000;  // Default
+            if (argc > 1) {
+                numRequests = std::atoi(argv[1]);
+            }
+            
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            auto start_time = std::chrono::high_resolution_clock::now();
+            
+            Client client;
+            client.run(numRequests);
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            
+            std::cout << "\n==============================" << std::endl;
+            std::cout << "Client total runtime: " << std::fixed << std::setprecision(3) 
+                      << duration.count() / 1000.0 << " seconds." << std::endl;
+            std::cout << "==============================\n" << std::endl;
+            
+            // Give time for final messages to be processed
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            
+            // --- GRACEFUL SHUTDOWN INITIATION ---
+            std::cout << "Client completed. Sending shutdown signal..." << std::endl;
+            // Send a shutdown signal to the Switch. It will propagate it.
+            // todo send total number of requests
+            // The message content doesn't matter, only the tag.
+            // MPI_Send(nullptr, 0, MPI_CHAR, SWITCH_RANK, SHUTDOWN_SIGNAL, MPI_COMM_WORLD);
+
+            // Wait for all other processes to finish before client exits
+            // MPI_Barrier(MPI_COMM_WORLD);
+            
+            break;
+        }
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
+=== END OF main.cpp ===
+
+
+=== FILE: netagg.cpp ===
+
+// === FILE: netagg.cpp ===
+#include "netagg.hpp"
+#include <vector>
+#include <chrono>
+#include <algorithm>  // For std::sort
+
+NetAgg::NetAgg() : rank(NETAGG_RANK), currentLeader(LEADER_RANK), currentLeaderTerm(1), netAggCommitIndex(0),
+                   aggCommitBatchTimer(), noProgressCounter(0) {
+    followerMatchIndex[FOLLOWER1_RANK] = 0;
+    followerMatchIndex[FOLLOWER2_RANK] = 0;
+}
+
+NetAgg::~NetAgg() {
+    for (auto& send : outstandingSends) {
+        delete[] send.buffer;
+    }
+}
+
+void NetAgg::run(bool& shutdown_flag) {
+    log_debug("NETAGG", "Started with rank " + std::to_string(rank));
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;
+    
+    // *** ENHANCED NETAGG FLOW CONTROL ***
+    const int AGGRESSIVE_CLEANUP_THRESHOLD = 50;
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int cleanupCounter = 0;
+
+    while (!shutdown_flag) {
+        // *** MORE AGGRESSIVE SEND COMPLETION CHECKING FOR LATENCY ***
+        checkCompletedSends();
+
+        MPI_Status status;
+        int flag = 0;
+        bool progress_made = false;
+
+        // *** IMPROVED BACKPRESSURE: Accept from Leader more conservatively ***
+        bool canAcceptFromLeader = (outstandingSends.size() <= (MAX_OUTSTANDING_SENDS * 0.7));  // Conservative for NetAgg
+        
+        if (canAcceptFromLeader) {
+            MPI_Iprobe(LEADER_RANK, APPEND_ENTRIES_NETAGG_REQUEST, MPI_COMM_WORLD, &flag, &status);
+            if (flag) {
+                handleAppendEntriesFromLeader(status);
+                progress_made = true;
+                checkCompletedSends();  // Immediate cleanup after receiving from leader
+            }
+        }
+
+        // Always check for responses from followers, as they help clear the backlog
+        MPI_Iprobe(MPI_ANY_SOURCE, APPEND_ENTRIES_RESPONSE, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            if (status.MPI_SOURCE == FOLLOWER1_RANK || status.MPI_SOURCE == FOLLOWER2_RANK) {
+                 handleAppendEntriesResponse(status);
+                 progress_made = true;
+                 checkCompletedSends();  // Immediate cleanup after follower response
+            }
+        }
+        
+        if (sendBatchedAggCommits()) {
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after sending commits
+        }
+        
+        // *** ADDITIONAL CLEANUP CYCLES ***
+        cleanupCounter++;
+        if (cleanupCounter % 100 == 0) {
+            checkCompletedSends();
+        }
+        
+        if (outstandingSends.size() > AGGRESSIVE_CLEANUP_THRESHOLD) {
+            checkCompletedSends();
+        }
+
+        if (progress_made) {
+            noProgressCounter = 0;
+        } else {
+            noProgressCounter++;
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                // *** ENHANCED STALL LOGGING ***
+                std::cout << "[NETAGG_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                         << ", Pending entries: " << pendingEntriesMap.size()
+                         << ", Commit buffer: " << aggCommitBuffer.size()
+                         << ", Can accept: " << (canAcceptFromLeader ? "YES" : "NO") << std::endl;
+            }
+        }
+        
+        // *** PERIODIC HEALTH REPORTING ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
+        if (timeSinceStats.count() >= 30) {
+            std::cout << "[NETAGG_STATUS] Commit index: " << netAggCommitIndex 
+                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                     << ", Pending entries: " << pendingEntriesMap.size()
+                     << ", Follower1 match: " << followerMatchIndex[FOLLOWER1_RANK]
+                     << ", Follower2 match: " << followerMatchIndex[FOLLOWER2_RANK]
+                     << ", Progress checks: " << noProgressCounter << std::endl;
+            lastStatsTime = currentTime;
+        }
+        
+        // *** EMERGENCY CLEANUP FOR PENDING ENTRIES OVERFLOW ***
+        if (pendingEntriesMap.size() > 1000) {  // Emergency threshold
+            std::cout << "[NETAGG_WARNING] Pending entries overflow: " << pendingEntriesMap.size() 
+                     << ", forcing aggressive cleanup" << std::endl;
+            
+            // Force multiple cleanup cycles
+            for (int i = 0; i < 5; i++) {
+                checkCompletedSends();
+            }
+            
+            // Consider dropping very old pending entries if system is truly stuck
+            if (pendingEntriesMap.size() > 1500) {
+                std::cout << "[NETAGG_EMERGENCY] Dropping oldest pending entries to prevent deadlock" << std::endl;
+                auto it = pendingEntriesMap.begin();
+                int dropped = 0;
+                while (it != pendingEntriesMap.end() && dropped < 200) {
+                    it = pendingEntriesMap.erase(it);
+                    dropped++;
+                }
+                std::cout << "[NETAGG_EMERGENCY] Dropped " << dropped << " pending entries" << std::endl;
+            }
+        }
+        
+        // *** ULTRA-LOW LATENCY: Emergency commit for small pending entries when stalled ***
+        if (pendingEntriesMap.size() > 2 && noProgressCounter > 3000000) {  // Lowered from >10 and >5M - catch the 3-entry case faster
+            std::cout << "[NETAGG_LATENCY_EMERGENCY] Small pending entries (" << pendingEntriesMap.size() 
+                     << ") stuck for " << noProgressCounter << " checks - forcing commit" << std::endl;
+            
+            // Force commit all pending entries that we can
+            std::vector<AggCommitInfo> emergencyCommits;
+            for (const auto& [index, pendingEntry] : pendingEntriesMap) {
+                if (index > netAggCommitIndex) {
+                    emergencyCommits.push_back({index, pendingEntry.entryTerm});
+                    if (emergencyCommits.size() >= 50) break;  // Limit batch size
+                }
+            }
+            
+            if (!emergencyCommits.empty()) {
+                // Sort by index to commit in order
+                std::sort(emergencyCommits.begin(), emergencyCommits.end(), 
+                         [](const AggCommitInfo& a, const AggCommitInfo& b) {
+                             return a.commitIndex < b.commitIndex;
+                         });
+                
+                // Add to commit buffer
+                aggCommitBuffer.insert(aggCommitBuffer.end(), emergencyCommits.begin(), emergencyCommits.end());
+                
+                // Update commit index to the highest we're committing
+                netAggCommitIndex = emergencyCommits.back().commitIndex;
+                
+                // Clean up the committed entries
+                auto map_it = pendingEntriesMap.begin();
+                while (map_it != pendingEntriesMap.end()) {
+                    if (map_it->first <= netAggCommitIndex) {
+                        map_it = pendingEntriesMap.erase(map_it);
+                    } else {
+                        ++map_it;
+                    }
+                }
+                
+                std::cout << "[NETAGG_LATENCY_EMERGENCY] Force committed " << emergencyCommits.size() 
+                         << " entries up to index " << netAggCommitIndex << std::endl;
+                progress_made = true;
+            }
+        }
+        
+        // *** DETECT FOLLOWER SYNCHRONIZATION ISSUES ***
+        // Check if followers are lagging significantly behind
+        if (cleanupCounter % 1000 == 0) {  // Check every 1000 iterations
+            static int syncWarningCounter = 0;  // Move outside the conditional
+            
+            int minFollowerMatch = std::min(followerMatchIndex[FOLLOWER1_RANK], 
+                                          followerMatchIndex[FOLLOWER2_RANK]);
+            int maxFollowerMatch = std::max(followerMatchIndex[FOLLOWER1_RANK], 
+                                          followerMatchIndex[FOLLOWER2_RANK]);
+            int syncDiff = maxFollowerMatch - minFollowerMatch;
+            
+            // If followers are significantly out of sync
+            if (syncDiff > 100) {
+                // Only log every 100 checks to reduce spam
+                syncWarningCounter++;
+                
+                if (syncWarningCounter % 100 == 1) {  // Log first and every 100th
+                    std::cout << "[NETAGG_SYNC_WARNING] Followers out of sync - F1: " 
+                             << followerMatchIndex[FOLLOWER1_RANK] << ", F2: " 
+                             << followerMatchIndex[FOLLOWER2_RANK] << ", diff: " 
+                             << syncDiff << " (warning #" << syncWarningCounter << ")" << std::endl;
+                }
+                
+                // *** ENHANCED STALL LOGGING ***
+                if (syncWarningCounter % 1000 == 1) {  // Less frequent for this case
+                    std::cout << "[NETAGG_FOLLOWER_BEHIND] Slow follower is missing commits. "
+                             << "NetAgg: " << netAggCommitIndex << ", Slow follower: " << minFollowerMatch 
+                             << ". Follower may need to request missing entries." << std::endl;
+                }
+                
+                // *** IMMEDIATE RECOVERY: For the exact stuck scenario we're seeing ***
+                // Small differences (like 1000) that persist for even moderate time indicate deadlock
+                if (syncDiff >= 1000 && syncWarningCounter > 2000) {  // Much more aggressive
+                    int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
+                                      ? FOLLOWER1_RANK : FOLLOWER2_RANK;
+                    
+                    std::cout << "[NETAGG_IMMEDIATE_RECOVERY] Persistent small difference detected - forcing sync. "
+                             << "Slow follower " << slowFollower << " from " << followerMatchIndex[slowFollower] 
+                             << " to " << (maxFollowerMatch - 50) << " (diff=" << syncDiff 
+                             << ", stuck for " << syncWarningCounter << " attempts)" << std::endl;
+                    
+                    followerMatchIndex[slowFollower] = maxFollowerMatch - 50;
+                    syncWarningCounter = 0;
+                    progress_made = true;
+                }
+                
+                // *** EMERGENCY: Force slow follower to catch up ***
+                // Multiple thresholds for different scenarios:
+                // 1. Large differences (>25k) after moderate time (>1k checks)
+                // 2. Medium differences (>1k) after long time (>5k checks) 
+                // 3. Small differences (>500) after very long time (>20k checks)
+                // 4. Any difference (>100) after extremely long time (>50k checks)
+                
+                bool shouldForceSync = (syncDiff > 25000 && syncWarningCounter > 1000) ||
+                                     (syncDiff > 1000 && syncWarningCounter > 5000) ||
+                                     (syncDiff > 500 && syncWarningCounter > 20000) ||
+                                     (syncDiff > 100 && syncWarningCounter > 50000);
+                
+                if (shouldForceSync) {
+                    int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
+                                      ? FOLLOWER1_RANK : FOLLOWER2_RANK;
+                    
+                    std::cout << "[NETAGG_FORCE_SYNC] Force syncing slow follower " << slowFollower 
+                             << " from " << followerMatchIndex[slowFollower] 
+                             << " to " << (maxFollowerMatch - 100) << " (diff=" << syncDiff 
+                             << ", attempts=" << syncWarningCounter << ")" << std::endl;
+                    
+                    followerMatchIndex[slowFollower] = maxFollowerMatch - 100;  // Smaller gap
+                    syncWarningCounter = 0;  // Reset after force sync
+                    progress_made = true;
+                }
+                
+                // *** SUPER AGGRESSIVE: If stuck for extremely long time ***
+                if (syncWarningCounter > 10000) {  // Much lower threshold - was 3000
+                    std::cout << "[NETAGG_SUPER_RECOVERY] System stuck for " << syncWarningCounter 
+                             << " attempts (diff=" << syncDiff << "), force syncing both followers" << std::endl;
+                    
+                    // Set both followers to the same position near the max
+                    int syncTarget = maxFollowerMatch - 50;  // Very small gap
+                    followerMatchIndex[FOLLOWER1_RANK] = syncTarget;
+                    followerMatchIndex[FOLLOWER2_RANK] = syncTarget;
+                    
+                    // Also advance NetAgg commit index if needed
+                    if (syncTarget > netAggCommitIndex) {
+                        int commitCount = syncTarget - netAggCommitIndex;
+                        for (int idx = netAggCommitIndex + 1; idx <= syncTarget; idx++) {
+                            aggCommitBuffer.push_back({idx, currentLeaderTerm});
+                        }
+                        netAggCommitIndex = syncTarget;
+                        std::cout << "[NETAGG_SUPER_RECOVERY] Force committed " << commitCount 
+                                 << " entries up to " << syncTarget << std::endl;
+                    }
+                    
+                    syncWarningCounter = 0;
+                    progress_made = true;
+                }
+                
+                // *** CRITICAL DESYNC: Consider one follower broken ***
+                if (syncDiff > 100000) {
+                    std::cout << "[NETAGG_CRITICAL_DESYNC] One follower may be broken (diff=" 
+                             << syncDiff << "), considering single-follower operation" << std::endl;
+                    
+                    // *** EMERGENCY: If the gap is too large, reset the slow follower's match index ***
+                    if (syncDiff > 500000) {
+                        int slowFollower = (followerMatchIndex[FOLLOWER1_RANK] < followerMatchIndex[FOLLOWER2_RANK]) 
+                                          ? FOLLOWER1_RANK : FOLLOWER2_RANK;
+                        
+                        std::cout << "[NETAGG_FOLLOWER_RESET] Resetting match index for slow follower " 
+                                 << slowFollower << " from " << followerMatchIndex[slowFollower] 
+                                 << " to " << (maxFollowerMatch - 1000) << std::endl;
+                        
+                        followerMatchIndex[slowFollower] = maxFollowerMatch - 1000;  // Give it a chance to catch up
+                        syncWarningCounter = 0;
+                    }
+                }
+            } else {
+                syncWarningCounter = 0;  // Reset when sync is good
+            }
+        }
+    }
+}
+
+void NetAgg::forwardToFollowers(const AppendEntriesNetAggMsg& leaderMsg, const std::vector<RequestID>& batch_rids) {
+    std::vector<int> followers = {FOLLOWER1_RANK, FOLLOWER2_RANK};
+    std::string data_to_follower_str =
+        std::to_string(leaderMsg.term) + "|" +
+        std::to_string(leaderMsg.prevLogIndex) + "|" +
+        std::to_string(leaderMsg.prevLogTerm) + "|" +
+        std::to_string(leaderMsg.firstEntryIndex) + "|" +
+        leaderMsg.batchedEntryIds + "|" +
+        std::to_string(leaderMsg.commitIndex) + "|" +
+        std::to_string(leaderMsg.source) + "|" +
+        std::to_string(rank);
+
+    for (int follower_rank : followers) {
+        int msg_len = data_to_follower_str.length() + 1;
+        char* send_buffer = new char[msg_len];
+        strncpy(send_buffer, data_to_follower_str.c_str(), msg_len);
+
+        MPI_Request mpi_req;
+        MPI_Isend(send_buffer, msg_len, MPI_CHAR, follower_rank,
+                  APPEND_ENTRIES_REQUEST, MPI_COMM_WORLD, &mpi_req);
+
+        outstandingSends.push_back({mpi_req, send_buffer});
+    }
+}
+
+bool NetAgg::sendBatchedAggCommits() {
+    if (outstandingSends.size() > MAX_OUTSTANDING_SENDS) {
+        return false;
+    }
+
+    if (aggCommitBuffer.empty()) {
+        return false;
+    }
+
+    if (aggCommitBatchTimer == std::chrono::high_resolution_clock::time_point{}) {
+        aggCommitBatchTimer = std::chrono::high_resolution_clock::now();
+    }
+
+    auto now = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - aggCommitBatchTimer);
+
+    bool batchIsFull = aggCommitBuffer.size() >= BATCH_SIZE;
+    bool timeoutReached = elapsed.count() >= BATCH_TIMEOUT_MS;
+
+    if (!batchIsFull && !timeoutReached) {
+        return false;
+    }
+
+    size_t count_to_send = aggCommitBuffer.size();
+
+    std::string payload;
+    for (size_t i = 0; i < count_to_send; ++i) {
+        payload += std::to_string(aggCommitBuffer[i].commitIndex) + "," + std::to_string(aggCommitBuffer[i].term);
+        if (i < count_to_send - 1) {
+            payload += ";";
+        }
+    }
+
+    std::vector<int> all_servers = {LEADER_RANK, FOLLOWER1_RANK, FOLLOWER2_RANK};
+    for (int server_rank : all_servers) {
+        int msg_len = payload.length() + 1;
+        char* send_buffer = new char[msg_len];
+        strncpy(send_buffer, payload.c_str(), msg_len);
+
+        MPI_Request mpi_req;
+        MPI_Isend(send_buffer, msg_len, MPI_CHAR, server_rank,
+                  AGG_COMMIT, MPI_COMM_WORLD, &mpi_req);
+
+        outstandingSends.push_back({mpi_req, send_buffer});
+    }
+
+    aggCommitBuffer.erase(aggCommitBuffer.begin(), aggCommitBuffer.begin() + count_to_send);
+    aggCommitBatchTimer = std::chrono::high_resolution_clock::time_point{};
+    return true;
+}
+
+void NetAgg::checkCompletedSends() {
+    if (outstandingSends.empty()) return;
+    auto it = outstandingSends.begin();
+    while (it != outstandingSends.end()) {
+        int flag = 0;
+        MPI_Test(&it->request, &flag, MPI_STATUS_IGNORE);
+        if (flag) {
+            delete[] it->buffer;
+            it = outstandingSends.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void NetAgg::handleAppendEntriesFromLeader(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer_vec(msg_size);
+    MPI_Request request;
+    MPI_Irecv(buffer_vec.data(), msg_size, MPI_CHAR, LEADER_RANK, APPEND_ENTRIES_NETAGG_REQUEST, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+    std::string data(buffer_vec.data(), msg_size - 1);
+    
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 7) return;
+
+    AppendEntriesNetAggMsg leaderMsg;
+    std::vector<RequestID> batch_rids;
+    leaderMsg.term = std::stoi(parts[0]);
+    leaderMsg.prevLogIndex = std::stoi(parts[1]);
+    leaderMsg.prevLogTerm = std::stoi(parts[2]);
+    leaderMsg.firstEntryIndex = std::stoi(parts[3]);
+    leaderMsg.batchedEntryIds = parts[4];
+    batch_rids = deserialize_batched_ids(leaderMsg.batchedEntryIds);
+    leaderMsg.commitIndex = std::stoi(parts[5]);
+    leaderMsg.source = std::stoi(parts[6]);
+
+    if (leaderMsg.term < currentLeaderTerm) return;
+    if (leaderMsg.term > currentLeaderTerm) {
+        currentLeaderTerm = leaderMsg.term;
+        currentLeader = leaderMsg.source;
+        pendingEntriesMap.clear();
+    }
+
+    for (size_t i = 0; i < batch_rids.size(); ++i) {
+        int idx_1based = leaderMsg.firstEntryIndex + i;
+        if (idx_1based <= netAggCommitIndex) continue;
+        if (pendingEntriesMap.find(idx_1based) == pendingEntriesMap.end()) {
+            pendingEntriesMap.emplace(idx_1based, PendingEntry(idx_1based, batch_rids[i].term, leaderMsg.source));
+        }
+    }
+
+    if (!batch_rids.empty()) {
+        forwardToFollowers(leaderMsg, batch_rids);
+    }
+}
+
+void NetAgg::handleAppendEntriesResponse(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer_vec(msg_size);
+    MPI_Request request;
+    MPI_Irecv(buffer_vec.data(), msg_size, MPI_CHAR, status.MPI_SOURCE, APPEND_ENTRIES_RESPONSE, MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+    std::string data(buffer_vec.data(), msg_size - 1);
+    
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 4) return;
+
+    AppendEntriesResponseMsg resp;
+    resp.success = (parts[1] == "1");
+    if (!resp.success) return;
+
+    resp.matchIndex = std::stoi(parts[2]);
+    resp.source = std::stoi(parts[3]);
+    followerMatchIndex[resp.source] = resp.matchIndex;
+
+    int majority_acks_needed = 1;
+
+    for (auto& pair : pendingEntriesMap) {
+        if (resp.matchIndex >= pair.second.entryIndex) {
+            pair.second.acksFrom.insert(resp.source);
+        }
+    }
+
+    std::vector<AggCommitInfo> newlyCommitted;
+    int temp_commit_idx = netAggCommitIndex;
+    while(true) {
+        int next_idx = temp_commit_idx + 1;
+        auto it = pendingEntriesMap.find(next_idx);
+        if (it == pendingEntriesMap.end() || static_cast<int>(it->second.acksFrom.size()) < majority_acks_needed) {
+            break;
+        }
+        newlyCommitted.push_back({it->second.entryIndex, it->second.entryTerm});
+        temp_commit_idx = next_idx;
+    }
+
+    if (!newlyCommitted.empty()) {
+        aggCommitBuffer.insert(aggCommitBuffer.end(), newlyCommitted.begin(), newlyCommitted.end());
+        netAggCommitIndex = temp_commit_idx;
+        auto map_it = pendingEntriesMap.begin();
+        while (map_it != pendingEntriesMap.end()) {
+            if (map_it->first <= netAggCommitIndex) {
+                map_it = pendingEntriesMap.erase(map_it);
+            } else {
+                ++map_it;
+            }
+        }
+    }
+}
+=== END OF netagg.cpp ===
+
+
+=== FILE: netagg.hpp ===
+
+#ifndef NETAGG_HPP
+#define NETAGG_HPP
+
+#include "common.hpp"
+#include <thread>
+#include <algorithm>
+#include <list> // For managing outstanding sends
+#include <chrono> // For batching timer
+
+struct AggCommitInfo {
+    int commitIndex; // 1-based index
+    int term;
+};
+
+struct PendingEntry {
+    int entryIndex;
+    int entryTerm;
+    int leaderId;
+    std::set<int> acksFrom;
+    PendingEntry(int idx, int term, int leader) : entryIndex(idx), entryTerm(term), leaderId(leader) {}
+    bool operator<(const PendingEntry& other) const { return entryIndex < other.entryIndex; }
+};
+
+class NetAgg {
+private:
+    int rank;
+    int currentLeader;
+    int currentLeaderTerm;
+    std::map<int, int> followerMatchIndex;
+    std::map<int, PendingEntry> pendingEntriesMap;
+    int netAggCommitIndex; // 1-based index of highest known-committable entry
+
+    // Structure for non-blocking sends
+    struct OutstandingSend {
+        MPI_Request request;
+        char* buffer;
+    };
+    std::list<OutstandingSend> outstandingSends;
+
+    std::vector<AggCommitInfo> aggCommitBuffer;
+
+    // --- BATCHING TIMER ---
+    std::chrono::high_resolution_clock::time_point aggCommitBatchTimer;
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
+    void handleAppendEntriesFromLeader(MPI_Status& status);
+    void forwardToFollowers(const AppendEntriesNetAggMsg& leaderMsg, const std::vector<RequestID>& batch_rids);
+    void handleAppendEntriesResponse(MPI_Status& status);
+    bool sendBatchedAggCommits();
+    void checkCompletedSends();
+
+public:
+    NetAgg();
+    ~NetAgg(); // Destructor
+    void run(bool& shutdown_flag);
+};
+
+#endif // NETAGG_HPP
+
+=== END OF netagg.hpp ===
+
+
+=== FILE: readme.claude ===
+
+How to run on Meluxina
+Take one node
+srun --partition=gpu --account=p200633 --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus-per-task=0 --cpus-per-task=64 --mem=32GB --time=03:25:00 --qos=default --pty /bin/bash -l
+
+ml env/release/2024.1
+ml OpenMPI/5.0.3-GCC-13.3.0
+
+COMPILE
+
+make clean && make
+
+mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1000000
+
+ONCE compiled, run with multiple nodes
+
+sbatch run_multi_node.sh
+
+# HoverCraft++ Consensus Protocol Implementation
+
+This is a C++ implementation of the HoverCraft++ consensus protocol based on the TLA+ specification. It demonstrates the protocol's key components and message flow in a perfect network environment (no failures or message loss).
+
+## Components
+
+1. **Switch (Rank 0)**: Receives client requests and replicates payloads to all servers
+2. **Leader (Rank 1)**: Orders requests and sends metadata to NetAgg
+3. **Follower1 (Rank 2)**: Receives payloads and metadata, maintains replicated log
+4. **Follower2 (Rank 3)**: Same as Follower1
+5. **NetAgg (Rank 4)**: Aggregates acknowledgments and sends commit messages
+6. **Client (Rank 5)**: Sends requests and measures end-to-end latency
+
+Key Components:
+
+common.hpp: Defines all message types, structures, and common utilities
+switch.cpp: Implements the Switch that receives client requests and replicates payloads
+leader.cpp: Implements the Leader that orders requests and coordinates with NetAgg
+netagg.cpp: Implements the NetAgg that aggregates follower acknowledgments
+follower.cpp: Implements Followers that maintain replicated logs
+client.cpp: Implements a Client that sends requests and measures latency
+main.cpp: Main driver that launches all components based on MPI rank
+Makefile: Build configuration
+README.md: Documentation
+
+
+## Protocol Flow
+
+1. Client sends request to Switch with designated responder
+2. Switch replicates payload to Leader and all Followers
+3. Leader orders the request and sends metadata to NetAgg
+4. NetAgg forwards metadata to Followers
+5. Followers acknowledge to NetAgg
+6. NetAgg sends AggCommit to all servers when majority achieved
+7. Designated server responds to Client
+
+## Building
+
+```bash
+make
+```
+
+## Running
+
+Default run with 100 requests:
+```bash
+make run
+```
+
+Run with custom number of requests:
+```bash
+make run-custom REQUESTS=1000
+```
+
+Or directly:
+```bash
+mpirun -np 6 ./hovercraft_demo [num_requests]
+```
+
+## Output
+
+The program outputs:
+- Debug logs from each component showing message flow
+- Latency statistics including average, min, max, and percentiles
+
+## Key Features Demonstrated
+
+- **Decoupled Payload Replication**: Switch handles payload distribution separately from ordering
+- **Network Aggregation**: NetAgg reduces leader's coordination overhead
+- **Load Balancing**: Client can designate any server to respond
+- **Perfect Prototype**: Assumes no failures for measuring baseline performance
+
+## Implementation Notes
+
+- Uses MPI for inter-process communication
+- Simple serialization format (pipe-delimited strings)
+- Fixed component assignment (no leader election)
+- Synchronous message handling with polling
+- Measures end-to-end latency from client perspective
+
+## Limitations
+
+This is a simplified prototype that:
+- Assumes perfect network (no message loss)
+- Does not implement leader election
+- Does not handle server crashes
+- Uses basic serialization (production would use protobuf/similar)
+- Does not implement point-to-point recovery for failed followers
+
+HowTo run on Meluxina
+
+rsync --rsh='ssh -p 8822 -i ~/.ssh/id_ed25519_mlux' -avzu ~/Documents/granular-storage/hovercraft-simulator/claude/ u100122@login.lxp.lu:/home/users/u100122/hovercraft/claude/
+
+ml env/release/2024.1
+ml OpenMPI/5.0.3-GCC-13.3.0
+[u100122@mel2044 ~]$ make clean
+make: *** No rule to make target 'clean'.  Stop.
+[u100122@mel2044 ~]$ cd hovercraft/claude/
+[u100122@mel2044 claude]$ make clean
+rm -f hovercraft_demo switch leader follower netagg client *.o
+[u100122@mel2044 claude]$ make
+mpic++ -std=c++17 -O2 -Wall -Wextra -o hovercraft_demo main.cpp
+In file included from main.cpp:3:
+common.hpp: In function ‘void log_debug(const std::string&, const std::string&)’:
+common.hpp:114:42: warning: unused parameter ‘component’ [-Wunused-parameter]
+  114 | inline void log_debug(const std::string& component, const std::string& message) {
+      |                       ~~~~~~~~~~~~~~~~~~~^~~~~~~~~
+common.hpp:114:72: warning: unused parameter ‘message’ [-Wunused-parameter]
+  114 | inline void log_debug(const std::string& component, const std::string& message) {
+      |                                                     ~~~~~~~~~~~~~~~~~~~^~~~~~~
+[u100122@mel2044 claude]$ mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1
+[CLIENT] Received response for value 1 from server 3 (expected 3), result=SUCCESS, latency: 0.272000 ms
+
+=== Latency Statistics (ms) ===
+Requests processed: 1
+Average: 0.272
+Min:     0.272
+Max:     0.272
+P50 (Median): 0.272
+P90:     0.272
+P99:     0.272
+==============================
+
+Client completed. Exiting...
+
+
+I_MPI_FABRICS=shm mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 200000
+
+with MPICH
+
+ 1002  ml env/release/2024.1
+ 1003  ml MPICH/4.2.2-GCC-13.3.0
+ 1004  make clean
+ 1005  make
+ 1006  MPIR_CVAR_CH4_NETMOD=shm mpirun -np 6 --bind-to core ./hovercraft_demo 3000000
+ 
+ --- Statistics for interval ending at 2990000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.320
+P50 (Median): 0.030
+P90:     0.031
+P99:     0.038
+==============================
+
+
+--- Statistics for interval ending at 2995000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.242
+P50 (Median): 0.030
+P90:     0.034
+P99:     0.038
+==============================
+
+
+--- Statistics for interval ending at 3000000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 5000
+Average: 0.031
+Min:     0.022
+Max:     1.230
+P50 (Median): 0.030
+P90:     0.033
+P99:     0.038
+==============================
+
+
+=== Latency Statistics (ms) ===
+No responses received.
+==============================
+
+
+==============================
+Client total runtime: 19.521 seconds.
+==============================
+
+Client completed. Sending shutdown signal...
+
+
+srun --partition=gpu --account=p200633 --nodes=1 --ntasks=1 --ntasks-per-node=1 --gpus-per-task=0 --cpus-per-task=64 --mem=32GB --time=03:25:00 --qos=default --pty /bin/bash -l
+
+ 
+
+=== END OF readme.claude ===
+
+
+=== FILE: run_multi_node.sh ===
+
+#!/bin/bash
+
+#SBATCH --job-name=hovercraft_multinode
+#SBATCH --partition=gpu
+#SBATCH --account=p200633
+#SBATCH --nodes=6
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-task=0
+#SBATCH --mem=16GB
+#SBATCH --ntasks=6
+#SBATCH --cpus-per-task=8
+#SBATCH --time=00:01:00
+#SBATCH --output=slurm_output_%j.out
+#SBATCH --error=slurm_output_%j.err
+#SBATCH --qos=default
+
+echo "Sourcing /etc/profile to set up environment..."
+source /etc/profile
+echo "Environment sourced."
+echo ""
+
+# --- Environment Setup ---
+# It's good practice to start from a clean environment
+#ml purge
+# Load the modules needed for your application (as you did before)
+echo "Loading environment modules..."
+ml env/release/2024.1
+ml OpenMPI/5.0.3-GCC-13.3.0
+echo "Modules loaded."
+echo ""
+
+# --- Job Information ---
+echo "Slurm Job ID: $SLURM_JOB_ID"
+echo "Running on nodes: "
+scontrol show hostnames $SLURM_JOB_NODELIST
+echo "--------------------------"
+echo ""
+
+# --- Application Execution ---
+# We will run one MPI process on each of the 6 allocated nodes.
+# $SLURM_NTASKS will be 6 based on the directives above (nodes * ntasks-per-node).
+#
+# NOTE: We remove '--oversubscribe' because Slurm has allocated dedicated resources.
+# We also remove '--map-by core --bind-to core' because with only one task per node,
+# MPI's default process placement is usually optimal. The process has the entire
+# node's CPUs at its disposal.
+echo "Launching HoverCraft++ with 1,000,000 requests..."
+
+mpirun -np $SLURM_NTASKS ./hovercraft_demo 1000000
+
+#use with 1 node 6 tasks per node
+#mpirun --oversubscribe -np 6 --map-by core --bind-to core ./hovercraft_demo 1000000
+
+echo "--------------------------"
+echo "Job finished."
+
+=== END OF run_multi_node.sh ===
+
+
+=== FILE: slurm_output_3296444.out ===
+
+Sourcing /etc/profile to set up environment...
+Environment sourced.
+
+Loading environment modules...
+Modules loaded.
+
+Slurm Job ID: 3296444
+Running on nodes: 
+mel2101
+mel2103
+mel2121
+mel2122
+mel2123
+mel2124
+--------------------------
+
+Launching HoverCraft++ with 1,000,000 requests...
+
+--- Statistics for interval ending at 100000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.768
+Min:     0.356
+Max:     51.175
+P50 (Median): 5.785
+P90:     5.922
+P99:     6.169
+==============================
+
+
+--- Statistics for interval ending at 200000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.605
+Min:     0.369
+Max:     7.128
+P50 (Median): 5.816
+P90:     5.937
+P99:     6.164
+==============================
+
+
+--- Statistics for interval ending at 300000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.600
+Min:     0.396
+Max:     7.127
+P50 (Median): 5.814
+P90:     5.939
+P99:     6.156
+==============================
+
+
+--- Statistics for interval ending at 400000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.614
+Min:     0.357
+Max:     7.136
+P50 (Median): 5.832
+P90:     5.951
+P99:     6.175
+==============================
+
+
+--- Statistics for interval ending at 500000 total requests ---
+
+=== Latency Statistics (ms) ===
+Requests processed: 100000
+Average: 5.773
+Min:     0.383
+Max:     53.330
+P50 (Median): 5.833
+P90:     5.962
+P99:     7.735
+==============================
+
+
+=== END OF slurm_output_3296444.out ===
+
+
+=== FILE: switch.cpp ===
+
+#include "switch.hpp"
+#include <vector> // For safer buffer management on receive
+#include <chrono>
+
+// Add a destructor to clean up any remaining buffers
+Switch::~Switch() {
+    for (auto& send : outstandingSends) {
+        delete[] send.buffer;
+    }
+}
+
+Switch::Switch() : rank(SWITCH_RANK), currentTerm(1), nextValue(1), replicatedCount(0), noProgressCounter(0) {
+    switchSentRecord[LEADER_RANK] = {};
+    switchSentRecord[FOLLOWER1_RANK] = {};
+    switchSentRecord[FOLLOWER2_RANK] = {};
+}
+
+void Switch::run(bool& shutdown_flag) {
+    log_debug("SWITCH", "Started with rank " + std::to_string(rank));
+    const uint64_t NO_PROGRESS_LOG_INTERVAL = 5000000;
+    
+    // *** ENHANCED SWITCH FLOW CONTROL ***
+    const int MAX_BUFFER_SIZE = 200;  // Limit switch buffer growth
+    const int AGGRESSIVE_CLEANUP_THRESHOLD = 50;  // More aggressive cleanup
+    auto lastStatsTime = std::chrono::high_resolution_clock::now();
+    int cleanupCounter = 0;
+    
+    while (!shutdown_flag) {
+        auto loopStart = std::chrono::high_resolution_clock::now();
+        
+        // *** MORE AGGRESSIVE SEND COMPLETION CHECKING FOR LATENCY ***
+        checkCompletedSends();
+        
+        MPI_Status status;
+        int flag;
+        bool progress_made = false;
+        
+        // *** IMPROVED BACKPRESSURE WITH BUFFER LIMITS ***
+        bool canAcceptRequests = (outstandingSends.size() <= MAX_OUTSTANDING_SENDS) && 
+                                (switchBuffer.size() < MAX_BUFFER_SIZE);
+        
+        if (canAcceptRequests) {
+            MPI_Iprobe(MPI_ANY_SOURCE, CLIENT_REQUEST, MPI_COMM_WORLD, &flag, &status);
+            if (flag) {
+                handleClientRequest(status);
+                progress_made = true;
+                checkCompletedSends();  // Immediate cleanup after receiving client request
+            }
+        }
+        
+        // *** PRIORITIZE REPLICATION TO CLEAR BUFFERS ***
+        if (replicateBufferedRequests()) {
+            progress_made = true;
+            checkCompletedSends();  // Immediate cleanup after replication
+        }
+        
+        // *** ADDITIONAL CLEANUP CYCLES FOR STALL PREVENTION ***
+        cleanupCounter++;
+        if (cleanupCounter % 100 == 0) {  // Every 100 iterations
+            checkCompletedSends();  // Extra cleanup
+        }
+        
+        // *** MORE AGGRESSIVE CLEANUP WHEN BACKLOGGED ***
+        if (outstandingSends.size() > AGGRESSIVE_CLEANUP_THRESHOLD) {
+            checkCompletedSends();  // Extra aggressive cleanup
+        }
+
+        if (progress_made) {
+            noProgressCounter = 0;
+        } else {
+            noProgressCounter++;
+            if (noProgressCounter > 0 && (noProgressCounter % NO_PROGRESS_LOG_INTERVAL == 0)) {
+                // *** ENHANCED STALL LOGGING ***
+                std::cout << "[SWITCH_STALLED] No progress after " << noProgressCounter 
+                         << " checks. Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
+                         << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                         << ", Can accept: " << (canAcceptRequests ? "YES" : "NO") << std::endl;
+            }
+        }
+        
+        // *** PERIODIC HEALTH REPORTING ***
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        auto timeSinceStats = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastStatsTime);
+        if (timeSinceStats.count() >= 30) {  // Every 30 seconds
+            std::cout << "[SWITCH_STATUS] Processed: " << replicatedCount 
+                     << ", Buffer: " << switchBuffer.size() << "/" << MAX_BUFFER_SIZE
+                     << ", Outstanding: " << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS
+                     << ", Progress checks: " << noProgressCounter << std::endl;
+            lastStatsTime = currentTime;
+        }
+        
+        // *** EMERGENCY BUFFER OVERFLOW PROTECTION ***
+        if (switchBuffer.size() >= MAX_BUFFER_SIZE * 0.9) {  // 90% full
+            std::cout << "[SWITCH_WARNING] Buffer near capacity: " << switchBuffer.size() 
+                     << "/" << MAX_BUFFER_SIZE << ", forcing aggressive cleanup" << std::endl;
+            
+            // Force multiple cleanup cycles
+            for (int i = 0; i < 5; i++) {
+                checkCompletedSends();
+            }
+            
+            // If still problematic, drop oldest requests (emergency measure)
+            if (switchBuffer.size() >= MAX_BUFFER_SIZE) {
+                std::cout << "[SWITCH_EMERGENCY] Dropping oldest buffered requests to prevent deadlock" << std::endl;
+                auto it = switchBuffer.begin();
+                int dropped = 0;
+                while (it != switchBuffer.end() && dropped < 50) {
+                    it = switchBuffer.erase(it);
+                    dropped++;
+                }
+                std::cout << "[SWITCH_EMERGENCY] Dropped " << dropped << " requests" << std::endl;
+            }
+        }
+    }
+}
+
+void Switch::handleClientRequest(MPI_Status& status) {
+    int msg_size;
+    MPI_Get_count(&status, MPI_CHAR, &msg_size);
+    std::vector<char> buffer_vec(msg_size);
+    MPI_Request request;
+    MPI_Irecv(buffer_vec.data(), msg_size, MPI_CHAR, status.MPI_SOURCE, CLIENT_REQUEST,
+             MPI_COMM_WORLD, &request);
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
+
+    std::string data(buffer_vec.data(), msg_size -1);
+    
+    std::vector<std::string> parts = split_string(data, '|');
+    if (parts.size() < 3) {
+        log_debug("SWITCH_ERROR", "Malformed client request: " + data);
+        return;
+    }
+    
+    ClientRequestMsg request_msg;
+    request_msg.value = std::stoi(parts[0]);
+    request_msg.respondTo = std::stoi(parts[1]);
+    request_msg.payload = parts[2];
+
+    // std::cout << "[SWITCH] RECV_REQ value=" << request_msg.value << std::endl;
+    
+    RequestID rid{request_msg.value, currentTerm};
+    LogEntry entry(currentTerm, request_msg.value, request_msg.payload, request_msg.respondTo);
+    
+    if (switchBuffer.find(rid) == switchBuffer.end()) {
+        switchBuffer[rid] = entry;
+    }
+}
+
+void Switch::sendReplicateMessage(int dest, const RequestID& rid, const LogEntry& entry) {
+    std::string msg_str = std::to_string(rid.value) + "|" + 
+                         std::to_string(rid.term) + "|" + 
+                         entry.payload + "|" + 
+                         std::to_string(entry.clientRank);
+
+    int msg_len = msg_str.length() + 1;
+    char* send_buffer = new char[msg_len];
+    strncpy(send_buffer, msg_str.c_str(), msg_len);
+
+    // std::cout << "[SWITCH] REPL_SEND to=" << dest << " value=" << rid.value << std::endl;
+    
+    MPI_Request mpi_req;
+    MPI_Isend(send_buffer, msg_len, MPI_CHAR, dest, SWITCH_REPLICATE, MPI_COMM_WORLD, &mpi_req);
+    
+    outstandingSends.push_back({mpi_req, send_buffer});
+}
+
+void Switch::checkCompletedSends() {
+    if (outstandingSends.empty()) {
+        return;
+    }
+    
+    int initialCount = outstandingSends.size();
+    int completedCount = 0;
+    
+    auto it = outstandingSends.begin();
+    while (it != outstandingSends.end()) {
+        int flag = 0;
+        MPI_Test(&it->request, &flag, MPI_STATUS_IGNORE);
+        if (flag) {
+            delete[] it->buffer;
+            it = outstandingSends.erase(it);
+            completedCount++;
+        } else {
+            ++it;
+        }
+    }
+    
+    // *** ENHANCED MONITORING FOR SEND COMPLETION ***
+    if (initialCount > 50 && completedCount > 0) {  // Only log when there's significant activity
+        std::cout << "[SWITCH_SENDS] Completed " << completedCount << "/" << initialCount 
+                 << " sends, remaining: " << outstandingSends.size() << std::endl;
+    }
+    
+    // *** WARNING FOR STUCK SENDS ***
+    static int consecutiveNoCompletion = 0;
+    if (completedCount == 0 && initialCount > 75) {
+        consecutiveNoCompletion++;
+        if (consecutiveNoCompletion % 1000 == 0) {  // Every 1000 calls with no completion
+            std::cout << "[SWITCH_SEND_WARNING] " << consecutiveNoCompletion 
+                     << " consecutive cleanup cycles with no completions, outstanding: " 
+                     << outstandingSends.size() << std::endl;
+        }
+    } else {
+        consecutiveNoCompletion = 0;
+    }
+}
+
+bool Switch::replicateBufferedRequests() {
+    if (switchBuffer.empty()) return false;
+
+    bool made_progress = false;
+    auto it = switchBuffer.begin();
+    int processedInThisCycle = 0;
+    const int MAX_PROCESS_PER_CYCLE = 10;  // Limit to prevent send queue overflow
+    
+    while (it != switchBuffer.end() && processedInThisCycle < MAX_PROCESS_PER_CYCLE) {
+        // *** CHECK SEND QUEUE CAPACITY BEFORE EACH REQUEST ***
+        // Each request generates 3 sends, so check if we have space for 3
+        if (outstandingSends.size() > (MAX_OUTSTANDING_SENDS - 3)) {
+            std::cout << "[SWITCH_BACKPRESSURE] Send queue near capacity: " 
+                     << outstandingSends.size() << "/" << MAX_OUTSTANDING_SENDS 
+                     << ", pausing replication" << std::endl;
+            return made_progress;
+        }
+
+        const auto& [rid, entry] = *it;
+        std::vector<int> targetServers = {LEADER_RANK, FOLLOWER1_RANK, FOLLOWER2_RANK};
+        
+        bool sentToAnyServer = false;
+        for (int server : targetServers) {
+            if (switchSentRecord[server].find(rid) == switchSentRecord[server].end()) {
+                sendReplicateMessage(server, rid, entry);
+                switchSentRecord[server].insert(rid);
+                sentToAnyServer = true;
+            }
+        }
+
+        // Only remove from buffer if we actually sent to at least one server
+        if (sentToAnyServer) {
+            it = switchBuffer.erase(it);
+            replicatedCount++;
+            made_progress = true;
+            processedInThisCycle++;
+            
+            // *** PERIODIC CLEANUP DURING REPLICATION ***
+            if (processedInThisCycle % 5 == 0) {
+                checkCompletedSends();  // Check every 5 requests
+            }
+        } else {
+            ++it;  // Move to next if nothing sent for this request
+        }
+
+        // *** EXISTING PRUNING LOGIC (IMPROVED) ***
+        const int PRUNE_INTERVAL = 5000;
+        const int RETAIN_WINDOW = 20000;
+        if (replicatedCount > 0 && replicatedCount % PRUNE_INTERVAL == 0) {
+            int prune_threshold = rid.value - RETAIN_WINDOW;
+            if (prune_threshold > 0) {
+                int totalPruned = 0;
+                for (auto& pair : switchSentRecord) {
+                    auto& sent_set = pair.second;
+                    for (auto set_it = sent_set.begin(); set_it != sent_set.end(); ) {
+                        if (set_it->value < prune_threshold) {
+                            set_it = sent_set.erase(set_it);
+                            totalPruned++;
+                        } else {
+                            ++set_it;
+                        }
+                    }
+                }
+                if (totalPruned > 0) {
+                    std::cout << "[SWITCH_PRUNED] Cleaned " << totalPruned 
+                             << " old sent records, threshold=" << prune_threshold << std::endl;
+                }
+            }
+        }
+    }
+    
+    // *** FINAL CLEANUP AFTER REPLICATION CYCLE ***
+    if (made_progress) {
+        checkCompletedSends();
+    }
+    
+    return made_progress;
+}
+=== END OF switch.cpp ===
+
+
+=== FILE: switch.hpp ===
+
+#ifndef SWITCH_HPP
+#define SWITCH_HPP
+
+#include "common.hpp"
+#include <list> // Use list for efficient removal
+
+class Switch {
+private:
+    int rank;
+    int currentTerm;
+    // No change to these
+    std::map<RequestID, LogEntry> switchBuffer;
+    std::map<int, std::set<RequestID>> switchSentRecord;
+    int nextValue;
+    long long replicatedCount; // Counter to trigger periodic cleanup
+
+    // A structure to track an ongoing send operation
+    struct OutstandingSend {
+        MPI_Request request;
+        char* buffer; // We need to keep the buffer alive
+    };
+    std::list<OutstandingSend> outstandingSends;
+
+    // For logging stalled progress
+    uint64_t noProgressCounter;
+
+    void handleClientRequest(MPI_Status& status);
+    bool replicateBufferedRequests(); // Changed to bool
+    // No change to sendReplicateMessage signature
+    void sendReplicateMessage(int dest, const RequestID& rid, const LogEntry& entry);
+    
+    // New function to clean up completed sends
+    void checkCompletedSends();
+
+public:
+    Switch();
+    ~Switch(); // Add a destructor to clean up
+    void run(bool& shutdown_flag);
+};
+
+#endif // SWITCH_HPP
+=== END OF switch.hpp ===
+
